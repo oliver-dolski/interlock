@@ -1,0 +1,30 @@
+#!/bin/sh
+# Rejects co-author trailers, generated-with banners, long dashes, and any
+# phrase in the untracked .git/info/commit-msg-deny list. Self-contained, no
+# language runtime required. Enable with: git config core.hooksPath .githooks
+msg_file="$1"
+deny_file="$(git rev-parse --git-path info/commit-msg-deny)"
+
+# Long dashes (em/en dash) never belong in a commit message here.
+if grep -q '[—–]' "$msg_file"; then
+  echo "commit-msg: refusing long dash (use a plain '-')." >&2
+  exit 1
+fi
+
+# Co-author trailers and generated-with banners.
+if grep -qiE '^(co-authored-by:|.*generated with)' "$msg_file"; then
+  echo "commit-msg: refusing co-author trailer or generated-with banner." >&2
+  exit 1
+fi
+
+# Machine-local deny phrases (case-insensitive, '#' lines and blanks skipped).
+if [ -f "$deny_file" ]; then
+  while IFS= read -r phrase; do
+    case "$phrase" in ''|\#*) continue ;; esac
+    if grep -qiF "$phrase" "$msg_file"; then
+      echo "commit-msg: refusing denied phrase: $phrase" >&2
+      exit 1
+    fi
+  done < "$deny_file"
+fi
+exit 0
