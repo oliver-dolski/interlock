@@ -1,0 +1,36 @@
+# OSDP lab: a LibOSDP Peripheral Device and Control Panel talking OSDP over TCP
+# with no hardware attached. The single declarative containment control for
+# SAFE-01 is the internal labnet together with the deliberate absence of any
+# ports: section on every service, so nothing is published to the host and no
+# container can reach outside the lab.
+name: interlock-lab
+
+networks:
+  labnet:
+    internal: true
+
+services:
+  pd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app/lab/osdp
+    command: ["python", "pd_driver.py"]
+    environment:
+      LAB_SCENARIO: ${LAB_SCENARIO:-cleartext}
+    networks:
+      - labnet
+
+  cp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app/lab/osdp
+    command: ["python", "cp_driver.py"]
+    environment:
+      LAB_SCENARIO: ${LAB_SCENARIO:-cleartext}
+      CP_UPSTREAM: ${CP_UPSTREAM:-pd:10000}
+    depends_on:
+      - pd
+    networks:
+      - labnet

@@ -45,3 +45,6 @@ warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "lab: integration tests that require Docker (deselect with -m 'not lab')",
+]
