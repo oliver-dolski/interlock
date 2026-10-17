@@ -15,7 +15,20 @@ import pytest
 from interlock.osdp import framer
 from interlock.osdp.codec import DecodeError, OsdpFrame, decode, encode
 
-FIXTURE = Path(__file__).resolve().parent / "fixtures" / "cleartext_sample.cap"
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+FIXTURE = FIXTURES_DIR / "cleartext_sample.cap"
+
+# The six per-direction vectors captured by the lab tap (03-02), one file per
+# direction for each TCP-tappable profile. These complete OSDP-01 SC1 for the
+# TCP-reachable profiles and feed the Secure Channel work in 03-04.
+PER_DIRECTION_FIXTURES = [
+    "cleartext_cp2pd.cap",
+    "cleartext_pd2cp.cap",
+    "sc-scbkd_cp2pd.cap",
+    "sc-scbkd_pd2cp.cap",
+    "downgrade_cp2pd.cap",
+    "downgrade_pd2cp.cap",
+]
 
 # A built, verified POLL frame (RESEARCH): SOM=53 ADDR=65 LEN=0008 CTRL=05(seq1|CRC)
 # CODE=60(POLL) CRC=51a3, no SCB, no MARK.
@@ -102,3 +115,32 @@ def test_overlong_declared_length_fails_closed() -> None:
     overlong = b"\x53\x65\xff\x00\x05\x60\x51\xa3"
     with pytest.raises(DecodeError):
         decode(overlong)
+
+
+@pytest.mark.parametrize("name", PER_DIRECTION_FIXTURES)
+def test_per_direction_fixture_frames_round_trip(name: str) -> None:
+    """Every frame in each per-direction vector re-encodes byte-identically (SC1).
+
+    Covers frames with and without a MARK, with and without an SCB, and with
+    opaque SC-encrypted payloads (the sc-scbkd vectors), across both directions.
+    """
+    raw = (FIXTURES_DIR / name).read_bytes()
+    assert raw, f"{name} is empty; regenerate it with the lab tap test"
+    frames = list(framer.iter_frames(raw))
+    assert frames, f"{name} yielded no trailer-valid frames"
+    for frame in frames:
+        assert encode(decode(frame)) == frame
+
+
+def test_oracle_exercises_mark_and_scb_hazards() -> None:
+    """The committed vectors include at least one MARK frame and one SCB frame."""
+    had_mark = False
+    had_scb = False
+    for name in PER_DIRECTION_FIXTURES:
+        raw = (FIXTURES_DIR / name).read_bytes()
+        for frame in framer.iter_frames(raw):
+            decoded = decode(frame)
+            had_mark = had_mark or decoded.had_mark
+            had_scb = had_scb or bool(decoded.scb)
+    assert had_mark, "no committed fixture frame carried a MARK; hazard not exercised"
+    assert had_scb, "no committed fixture frame carried an SCB; SC hazard not exercised"
