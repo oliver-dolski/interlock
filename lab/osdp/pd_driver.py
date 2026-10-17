@@ -1,26 +1,31 @@
 """Peripheral Device (reader) driver for the OSDP lab.
 
-Runs as the ``pd`` container's entrypoint. For this walking-skeleton slice the
-configuration is a single clear-text profile (``scbk=None``, no Secure Channel):
-the thinnest PD<->CP exchange that proves the transport and LibOSDP wiring. The
-``LAB_SCENARIO`` environment variable is read and logged now; scenario branching
-lands in plan 02-02.
+Runs as the ``pd`` container's entrypoint. The configuration is chosen by the
+``LAB_SCENARIO`` environment variable: it is looked up in ``scenarios`` (the one
+validated selection path) and the PD is built from the returned descriptor. An
+unknown, empty, or unset value fails closed - the driver lists the valid values on
+stderr and exits non-zero rather than defaulting to a scenario (ASVS V5).
 
 The PD listens on the lab TCP port, brings up a LibOSDP ``PeripheralDevice``,
 waits until the ControlPanel has it online, and notifies a single card-read
 event. It then idles so the refresh loop keeps the PD online for the lifetime of
-the container.
+the container. For the ``cleartext`` profile this is the clear-text tracer path
+the smoke test asserts; the ``sc-scbkd`` and ``downgrade`` profiles bring up
+Secure Channel (see ``scenarios`` for the confirmed flag mapping).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 
+import scenarios
 from osdp import (
     Capability,
     CardFormat,
     Event,
+    LibFlag,
     LogLevel,
     PDCapabilities,
     PDInfo,
@@ -44,23 +49,40 @@ def _card_read_event() -> dict[str, object]:
     }
 
 
+def _select_profile() -> scenarios.Profile:
+    """Resolve LAB_SCENARIO to a profile, or fail closed with the valid values."""
+    name = os.environ.get("LAB_SCENARIO", "")
+    try:
+        return scenarios.get(name)
+    except KeyError:
+        valid = ", ".join(scenarios.valid_values())
+        print(
+            f"interlock-lab: unknown LAB_SCENARIO {name!r}. Valid values: {valid}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(2) from None
+
+
 def main() -> None:
-    """Bring up the clear-text PD, notify one card read once online, then idle."""
-    scenario = os.environ.get("LAB_SCENARIO", "cleartext")
+    """Bring up the PD for the selected scenario, notify one card read, then idle."""
+    profile = _select_profile()
+    scenario = os.environ["LAB_SCENARIO"]
     print(f"interlock-lab: PD starting scenario={scenario}", flush=True)
     print(f"interlock-lab: PD listening on 0.0.0.0:{LAB_PORT}", flush=True)
 
+    # The PD runs install mode (scbk=None, derives the default SCBK-D) whenever the
+    # profile carries the InstallMode flag; otherwise it uses the profile's explicit key.
+    install_mode = "InstallMode" in profile.flags
+    pd_scbk = None if install_mode else profile.scbk
+    pd_flags = [getattr(LibFlag, flag) for flag in profile.flags]
+
     conn = listen("0.0.0.0", LAB_PORT)
-    pd_info = PDInfo(PD_ADDRESS, TCPChannel(conn), scbk=None)
+    pd_info = PDInfo(PD_ADDRESS, TCPChannel(conn), scbk=pd_scbk, flags=pd_flags)
     pd_cap = PDCapabilities(
-        [
-            (Capability.OutputControl, 1, 1),
-            (Capability.LEDControl, 2, 1),
-            (Capability.AudibleControl, 1, 1),
-            (Capability.TextOutput, 1, 1),
-        ]
+        [(getattr(Capability, name), compliance, count) for name, compliance, count in profile.caps]
     )
-    pd = PeripheralDevice(pd_info, pd_cap, log_level=LogLevel.Warning)
+    pd = PeripheralDevice(pd_info, pd_cap, log_level=LogLevel.Info)
     pd.start()
 
     deadline = time.monotonic() + ONLINE_TIMEOUT_SECONDS
