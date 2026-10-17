@@ -11,6 +11,10 @@ license = "Apache-2.0"
 dependencies = [
     "typer>=0.12",
     "rich>=13",
+    # AES-128-ECB for SCBK-D detection in 03-04 (OSDP-03) and weak-key work in Phase 4.
+    "cryptography>=43",
+    # Serial endpoint for the pty tap (03-02) and the Phase 4 path to real RS-485 (SAFE-02).
+    "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]
