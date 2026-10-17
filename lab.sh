@@ -36,11 +36,12 @@ case "$scenario" in
         exec env LAB_SCENARIO="$scenario" docker compose up "$@"
         ;;
     cve-replay)
-        # Seam for plan 02-04: cve-replay runs on the pinned-vulnerable libosdp
-        # v2.4.0 image via a compose override (docker-compose.vuln.yml), which
-        # does not exist yet. Until then it is a known value that is not servable
-        # on the fixed image.
-        reject "cve-replay runs on the vuln image, wired in plan 02-04"
+        # cve-replay runs on the pinned-vulnerable libosdp v2.4.0 image via the
+        # docker-compose.vuln.yml override, layered on top of the base compose
+        # file. The override swaps pd and cp onto the vuln image and keeps the lab
+        # internal with no published ports (SAFE-01).
+        exec env LAB_SCENARIO="$scenario" \
+            docker compose -f docker-compose.yml -f docker-compose.vuln.yml up "$@"
         ;;
     *)
         reject "unknown scenario '${scenario}'"
