@@ -1,0 +1,44 @@
+# cve-replay override: swap the pd and cp services onto the deliberately
+# vulnerable libosdp v2.4.0 image (Dockerfile.vuln) for the cve-replay profile.
+# Layer this on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vuln.yml up
+#
+# or via the wrapper: `sh ./lab.sh up cve-replay`.
+#
+# The v2.4.0 C-ext API has no user-defined TCP channel (only uart/msgq/fifo/
+# unix_bus), so the vuln pd and cp talk over a shared-volume named pipe (fifo)
+# instead of the TCP path the fixed profiles use. The attacker service from the
+# base file is inherited unchanged; because the vuln CP does not dial it over TCP,
+# it simply idles in accept() - contained and harmless on the internal labnet.
+#
+# Containment is unchanged (SAFE-01): labnet stays internal: true (inherited), no
+# service adds a ports: section, and the fifo bus is a local named volume with no
+# host bind mount, so nothing is published or reachable from outside the lab. The
+# vuln image is reachable only via this override (SAFE-03).
+
+services:
+  pd:
+    build:
+      context: .
+      dockerfile: Dockerfile.vuln
+    image: interlock-lab-vuln
+    working_dir: /app/lab/vuln
+    command: ["python", "pd_driver.py"]
+    volumes:
+      - osdp_bus:/busvol
+
+  cp:
+    build:
+      context: .
+      dockerfile: Dockerfile.vuln
+    image: interlock-lab-vuln
+    working_dir: /app/lab/vuln
+    command: ["python", "cp_driver.py"]
+    volumes:
+      - osdp_bus:/busvol
+
+volumes:
+  # Local named volume carrying the fifo bus between pd and cp. Not a host bind
+  # mount: the bus stays inside the lab (SAFE-01).
+  osdp_bus:
