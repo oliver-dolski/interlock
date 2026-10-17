@@ -49,6 +49,17 @@ class ComposeHandle:
             time.sleep(1.0)
         return needle in self.logs(service)
 
+    def compose(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run an arbitrary ``docker compose`` subcommand against this stack."""
+        return subprocess.run(
+            [*self.base_cmd, *args],
+            cwd=REPO_ROOT,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
 
 ComposeUp = Callable[..., ComposeHandle]
 
