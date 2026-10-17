@@ -1,0 +1,59 @@
+# Deliberately-vulnerable LibOSDP lab image for the cve-replay profile.
+#
+# CVE-2024-52288 lives in the LibOSDP C core (src/osdp_cp.c) and was fixed in
+# 3.0.0, so it cannot come from PyPI: only patched >=3.0.0 ships there and the
+# single 2.x release (2.4.0) is yanked. The vulnerable core must be built from
+# source, pinned to the official goToMain repo tag v2.4.0 (commit ebdf6ab4).
+#
+# This image is for the lab only. It runs exclusively on the internal labnet via
+# the docker-compose.vuln.yml override, never with a published host port (SAFE-01,
+# SAFE-03). The v2.4.0 Python binding is the OLD raw C-extension API (dict-based
+# pd_info, manual refresh() loop, channel over local IPC) - wholly separate from
+# the fixed image's 3.0.8 osdp/*.py package. Its channel transport is a shared
+# named pipe (fifo) on a volume, because the old C-ext API offers no user-defined
+# TCP channel (only uart/msgq/fifo/unix_bus).
+#
+# Pinned to the bookworm (Debian 12, gcc 12) base on purpose: the v2.4.0 C sources
+# are from 2023 and trip gcc 14's promotion of -Wincompatible-pointer-types and
+# -Wimplicit-function-declaration to hard errors. gcc 12 keeps these as warnings,
+# so the era-matched toolchain compiles the pinned source without patching its C.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1
+
+# git: clone the pinned source + its c-utils submodule. cmake/build-essential:
+# configure the build (which substitutes the exact source paths into setup.py)
+# and compile the extension. None of these are needed at run time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git cmake build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin to tag v2.4.0; --recurse-submodules fetches the required c-utils sources.
+ARG LIBOSDP_TAG=v2.4.0
+ARG LIBOSDP_COMMIT=ebdf6ab4d3926b7b4215d6a3a162f0327c57f8f7
+RUN git clone --branch "${LIBOSDP_TAG}" --depth 1 --recurse-submodules \
+        https://github.com/goToMain/libosdp /src/libosdp \
+    && HEAD_SHA="$(git -C /src/libosdp rev-parse HEAD)" \
+    && if [ "${HEAD_SHA}" != "${LIBOSDP_COMMIT}" ]; then \
+         echo "FATAL: libosdp HEAD ${HEAD_SHA} != pinned ${LIBOSDP_COMMIT}" >&2; \
+         exit 1; \
+       fi
+
+# cmake configure populates the C source lists and writes build/python/setup.py
+# from setup.py.in; pip then compiles the self-contained osdp C extension and
+# installs it into site-packages.
+#
+# The generated setup.py is patched first to drop empty tokens: some cmake
+# variables (definitions, extra include dirs) expand to the empty string, which
+# setup.py.in turns into a bare "-I" include and an empty "" compile arg that gcc
+# rejects ("linker input file not found"). Filtering the empties is the minimal
+# fix that keeps the upstream build otherwise intact.
+RUN cd /src/libosdp \
+    && mkdir build \
+    && cd build \
+    && cmake .. \
+    && python3 -c "p='python/setup.py'; s=open(p).read(); s=s.replace('for path in libosdp_include_dirs ]','for path in libosdp_include_dirs if path ]'); s=s.replace('osdp_module = setuptools.Extension(','sources = [x for x in sources if x]\ncompile_args = [x for x in compile_args if x]\nlink_args = [x for x in link_args if x]\n\nosdp_module = setuptools.Extension('); open(p,'w').write(s)" \
+    && pip install --no-cache-dir ./python
+
+WORKDIR /app/lab
+COPY lab/ /app/lab/
