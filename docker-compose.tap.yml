@@ -1,0 +1,17 @@
+# Tap-capture override: run interlock's own read-only TCP tap in the attacker
+# position instead of the Phase 2 proxy, writing one capture file per direction.
+#
+# For the attacker service only, this mounts ./src read-only so the stdlib-only
+# tap is importable, sets PYTHONPATH, and replaces the command with the tap-capture
+# entrypoint. It adds no ports and does not touch the internal labnet, so SAFE-01
+# containment is unchanged: a read-only source mount is code, not egress, and the
+# captures stay inside the attacker container (read out via docker compose exec).
+services:
+  attacker:
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+      ATTACKER_UPSTREAM: ${ATTACKER_UPSTREAM:-pd:10000}
+    command: ["python", "-m", "interlock.osdp.tap_capture"]
+    volumes:
+      - ./src:/app/src:ro
