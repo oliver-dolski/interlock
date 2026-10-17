@@ -45,6 +45,10 @@ warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# importlib import mode lets same-named test modules coexist across directories
+# (tests/osdp/test_codec_roundtrip.py and tests/lab/test_codec_roundtrip.py) without
+# __init__.py packaging; the legacy prepend mode rejects duplicate basenames.
+addopts = "--import-mode=importlib"
 markers = [
     "lab: integration tests that require Docker (deselect with -m 'not lab')",
 ]
