@@ -1,8 +1,10 @@
 # OSDP lab: a LibOSDP Peripheral Device and Control Panel talking OSDP over TCP
-# with no hardware attached. The single declarative containment control for
-# SAFE-01 is the internal labnet together with the deliberate absence of any
-# ports: section on every service, so nothing is published to the host and no
-# container can reach outside the lab.
+# with no hardware attached. The attacker service sits inline on the path, so
+# traffic flows cp -> attacker -> pd and the attacker observes the live session
+# (LAB-03). The single declarative containment control for SAFE-01 is the
+# internal labnet together with the deliberate absence of any ports: section on
+# every service, so nothing is published to the host and no container can reach
+# outside the lab.
 name: interlock-lab
 
 networks:
@@ -21,6 +23,22 @@ services:
     networks:
       - labnet
 
+  # The attacker relays the CP's traffic to the real PD (cp -> attacker -> pd) and
+  # captures it. No ports: here either - it is reachable only on the internal
+  # labnet, so inserting it changes nothing about SAFE-01 containment.
+  attacker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app/lab/attacker
+    command: ["python", "proxy.py"]
+    environment:
+      ATTACKER_UPSTREAM: ${ATTACKER_UPSTREAM:-pd:10000}
+    depends_on:
+      - pd
+    networks:
+      - labnet
+
   cp:
     build:
       context: .
@@ -29,8 +47,8 @@ services:
     command: ["python", "cp_driver.py"]
     environment:
       LAB_SCENARIO: ${LAB_SCENARIO:-cleartext}
-      CP_UPSTREAM: ${CP_UPSTREAM:-pd:10000}
+      CP_UPSTREAM: ${CP_UPSTREAM:-attacker:10000}
     depends_on:
-      - pd
+      - attacker
     networks:
       - labnet
