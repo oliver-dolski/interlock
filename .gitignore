@@ -16,5 +16,8 @@ venv/
 .coverage
 htmlcov/
 
+# Generated reports
+interlock-report.md
+
 # OS
 .DS_Store
