@@ -24,6 +24,7 @@ import scenarios
 from osdp import (
     Capability,
     CardFormat,
+    Command,
     Event,
     LibFlag,
     LogLevel,
@@ -35,6 +36,26 @@ from tcp_channel import LAB_PORT, TCPChannel, listen
 
 PD_ADDRESS = 101
 ONLINE_TIMEOUT_SECONDS = 30.0
+
+# The single lock-state sentinel every door-open attack (ATK-05a replay, ATK-08 spoof) proves
+# itself against (D-05). Wave-0 spike confirmed empirically (2026-10-18) that the high-level
+# PeripheralDevice command callback receives {'command': Command.Output, ...} when it processes
+# a CMD_OUT: fired unconditionally on every output command, regardless of control_code - the
+# oracle is the sentinel's appearance itself, not the specific output semantics.
+_LOCK_STATE_SENTINEL = "interlock-lab: LOCK state=UNLOCKED"
+
+
+def _handle_command(command: dict[str, object]) -> tuple[int, None]:
+    """Accept every command; fire the single D-05 lock-state sentinel on CMD_OUT.
+
+    Mirrors the accept-everything command handler in ``lab/vuln/pd_driver.py``. This is the
+    ONLY lab instrumentation Phase 4 adds (D-05, Pitfall 2 - do not over-instrument): one
+    sentinel log line when an output command is processed, nothing else new, and no other
+    lab-internal state exposed.
+    """
+    if command.get("command") == Command.Output:
+        print(_LOCK_STATE_SENTINEL, flush=True)
+    return 0, None
 
 
 def _card_read_event() -> dict[str, object]:
@@ -82,7 +103,9 @@ def main() -> None:
     pd_cap = PDCapabilities(
         [(getattr(Capability, name), compliance, count) for name, compliance, count in profile.caps]
     )
-    pd = PeripheralDevice(pd_info, pd_cap, log_level=LogLevel.Info)
+    pd = PeripheralDevice(
+        pd_info, pd_cap, log_level=LogLevel.Info, command_handler=_handle_command
+    )
     pd.start()
 
     deadline = time.monotonic() + ONLINE_TIMEOUT_SECONDS

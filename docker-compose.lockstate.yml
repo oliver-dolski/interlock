@@ -1,0 +1,34 @@
+# Lock-state-signal spike override (D-05 Wave-0, 04-07 Task 1): replace the production
+# cp_driver.py with a tiny inline Control Panel that drives ONE CMD_OUT ("output") command
+# after the PD comes online, so the Task 1 @lab test can observe the pd_driver.py lock-state
+# sentinel appear exactly when an output command is processed, having been absent before.
+#
+# This is a read-only lab-internal spike: it adds no port, touches no other service, and
+# stays on the same internal labnet, so SAFE-01 containment is unchanged.
+services:
+  cp:
+    command:
+      - python
+      - -c
+      - |
+        import time
+        from osdp import Command, ControlPanel, LogLevel, PDInfo
+        from tcp_channel import LAB_PORT, TCPChannel, connect_with_retry
+
+        PD_ADDRESS = 101
+        sock = connect_with_retry("pd", LAB_PORT)
+        cp = ControlPanel(
+            [PDInfo(PD_ADDRESS, TCPChannel(sock), scbk=None, flags=[])],
+            log_level=LogLevel.Info,
+        )
+        cp.start()
+        cp.online_wait(PD_ADDRESS, timeout=30)
+        print("interlock-lab: PD 101 online", flush=True)
+        time.sleep(1)
+        cp.send_command(
+            PD_ADDRESS,
+            {"command": Command.Output, "output_no": 0, "control_code": 2, "timer_count": 0},
+        )
+        print("interlock-lab: lock-state spike drove one CMD_OUT", flush=True)
+        while True:
+            time.sleep(1)
