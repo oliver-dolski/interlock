@@ -126,3 +126,37 @@ def test_spike_cmd_keyset_on_the_install_mode_wire(compose_up: ComposeUp) -> Non
         # does NOT auto-enrol over the wire, so ATK-04 uses the active-trigger path and the
         # host unit proves the SCBK-D session-key derivation on the committed handshake.
         assert constants.CMD_KEYSET not in cp_codes
+
+
+@pytest.mark.lab
+def test_keyset_recovers_scbk_d_on_the_live_sc_scbkd_lab(compose_up: ComposeUp) -> None:
+    """ATK-04 recovers the enrolled SCBK-D from the live install-mode KEYSET exchange."""
+    from interlock.osdp.attacks.keyset import run_keyset
+    from interlock.osdp.attacks.sniff import decode_chunks
+    from interlock.osdp.constants import SCBK_D
+    from interlock.osdp.transport import Direction
+
+    lab = compose_up("sc-scbkd", overrides=("docker-compose.tap.yml",))
+
+    # Precondition: the install-mode exchange (handshake + KEYSET) must transit the tap.
+    assert lab.wait_for_log("cp", "interlock-lab: PD 101 online", timeout=180), (
+        "PD never came online under the tap override"
+    )
+    assert lab.wait_for_log("cp", "interlock-lab: event received", timeout=90), (
+        "card-read event never observed under the tap override"
+    )
+
+    cp2pd = _read_capture(lab, "/app/capture/cp2pd.cap")
+    pd2cp = _read_capture(lab, "/app/capture/pd2cp.cap")
+    assert cp2pd, "cp->pd capture is empty"
+    assert pd2cp, "pd->cp capture is empty"
+
+    # Drive the exact collector the CLI observe path uses, then recover.
+    frames = decode_chunks(
+        [(Direction.cp_to_pd, cp2pd), (Direction.pd_to_cp, pd2cp)], max_frames=400
+    )
+    findings = run_keyset(frames)
+
+    matches = [f for f in findings if f.id == "ATK-04-keyset"]
+    assert len(matches) == 1, f"expected one KEYSET Finding, got {findings}"
+    assert SCBK_D.hex() in matches[0].evidence, matches[0].evidence
