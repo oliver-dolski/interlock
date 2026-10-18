@@ -13,6 +13,7 @@ from pathlib import Path
 import typer
 
 from interlock import registry, report
+from interlock.osdp.attacks import build_osdp_app
 
 app = typer.Typer(help="Extensible red-team and security-assessment platform.")
 
@@ -53,6 +54,10 @@ def run(
     report.render_terminal(findings)
     report.write_markdown(findings, path=output)
     typer.echo(f"Wrote report to {output}")
+
+
+# The OSDP offensive command group; attack subcommands are auto-discovered (D-01).
+app.add_typer(build_osdp_app(), name="osdp")
 
 
 if __name__ == "__main__":
