@@ -1,0 +1,19 @@
+# Spoof-MITM override (ATK-08): run interlock's inline unlock-spoof rewrite relay in the
+# attacker position instead of the Phase 2 proxy or the read-only tap. The relay waits for
+# the first cp->pd CMD_POLL and rewrites it, in flight, into a forged CMD_OUT (output
+# permanently ON) carrying that frame's own sequence number - so the lab PD lock-state
+# signal (D-05) flips to UNLOCKED.
+#
+# For the attacker service only, this mounts ./src read-only so the stdlib-only attack is
+# importable, sets PYTHONPATH, and replaces the command with the spoof entrypoint
+# (python -m interlock.osdp.attacks.spoof). It adds no ports and does not touch the internal
+# labnet, so SAFE-01 containment is unchanged.
+services:
+  attacker:
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+      ATTACKER_UPSTREAM: ${ATTACKER_UPSTREAM:-pd:10000}
+    command: ["python", "-m", "interlock.osdp.attacks.spoof"]
+    volumes:
+      - ./src:/app/src:ro
