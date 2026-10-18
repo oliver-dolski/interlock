@@ -1,0 +1,20 @@
+# Downgrade-MITM override (ATK-03): run interlock's inline Secure Channel downgrade
+# rewrite relay in the attacker position instead of the Phase 2 proxy or the read-only
+# tap. The relay strips the CommunicationSecurity capability from every REPLY_PDCAP in
+# flight, so a CP that does not enforce Secure Channel falls back to clear-text, and tees
+# the forwarded (post-rewrite) bytes to one capture file per direction.
+#
+# For the attacker service only, this mounts ./src read-only so the stdlib-only attack is
+# importable, sets PYTHONPATH, and replaces the command with the downgrade entrypoint
+# (python -m interlock.osdp.attacks.downgrade). It adds no ports and does not touch the
+# internal labnet, so SAFE-01 containment is unchanged: a read-only source mount is code,
+# not egress, and the captures stay inside the attacker container (read out via exec).
+services:
+  attacker:
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+      ATTACKER_UPSTREAM: ${ATTACKER_UPSTREAM:-pd:10000}
+    command: ["python", "-m", "interlock.osdp.attacks.downgrade"]
+    volumes:
+      - ./src:/app/src:ro
