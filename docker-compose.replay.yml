@@ -1,0 +1,20 @@
+# Replay-MITM override (ATK-05a): run interlock's inline clear-text card-presentation
+# replay relay in the attacker position instead of the Phase 2 proxy or the read-only
+# tap. The relay reuses spoof.unlock_transform (Task 2's craft helpers, for consistency):
+# once the live bus carries the genuine card-presentation exchange, the next cp->pd
+# CMD_POLL is rewritten into the unlock that exchange would, in a correctly wired system,
+# produce - so the lab PD lock-state signal (D-05) flips to UNLOCKED.
+#
+# For the attacker service only, this mounts ./src read-only so the stdlib-only attack is
+# importable, sets PYTHONPATH, and replaces the command with the replay entrypoint
+# (python -m interlock.osdp.attacks.replay). It adds no ports and does not touch the internal
+# labnet, so SAFE-01 containment is unchanged.
+services:
+  attacker:
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+      ATTACKER_UPSTREAM: ${ATTACKER_UPSTREAM:-pd:10000}
+    command: ["python", "-m", "interlock.osdp.attacks.replay"]
+    volumes:
+      - ./src:/app/src:ro
