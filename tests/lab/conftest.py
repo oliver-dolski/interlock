@@ -75,8 +75,14 @@ def compose_up() -> Iterator[ComposeUp]:
             files += ["-f", str(REPO_ROOT / override)]
         base_cmd = ["docker", "compose", "-p", PROJECT_NAME, *files]
         env = {**os.environ, "LAB_SCENARIO": scenario}
+        # --force-recreate is load-bearing for two-phase tests (downgrade: baseline then
+        # attacked in one project). A second bring-up only swaps the attacker service;
+        # without force-recreate the cp/pd containers keep running and the CP never
+        # re-homes onto the new attacker, so its capture stays empty. Forcing recreation
+        # restarts the whole stack, so each phase is a genuine fresh session through the
+        # current attacker. Harmless for single bring-ups.
         proc = subprocess.run(
-            [*base_cmd, "up", "-d", "--build"],
+            [*base_cmd, "up", "-d", "--build", "--force-recreate"],
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
