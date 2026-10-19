@@ -8,9 +8,9 @@
 #
 # The v2.4.0 C-ext API has no user-defined TCP channel (only uart/msgq/fifo/
 # unix_bus), so the vuln pd and cp talk over a shared-volume named pipe (fifo)
-# instead of the TCP path the fixed profiles use. The attacker service from the
-# base file is inherited unchanged; because the vuln CP does not dial it over TCP,
-# it simply idles in accept() - contained and harmless on the internal labnet.
+# instead of the TCP path the fixed profiles use. The attacker service - idle in
+# accept() on the base file's TCP proxy, since the vuln CP never dials it over TCP -
+# is re-homed below onto that same fifo bus (plan 04-08 Task 1, ATK-05b wave-0 spike).
 #
 # Containment is unchanged (SAFE-01): labnet stays internal: true (inherited), no
 # service adds a ports: section, and the fifo bus is a local named volume with no
@@ -36,6 +36,23 @@ services:
     working_dir: /app/lab/vuln
     command: ["python", "cp_driver.py"]
     volumes:
+      - osdp_bus:/busvol
+
+  # Task 1 (ATK-05b wave-0 spike): re-home the attacker from the inherited, idle
+  # Phase 2 TCP proxy (the vuln CP never dials it over TCP) onto the cve-replay
+  # fifo bus via lab/attacker/fifo_tap.py. Mounts ./src and ./lab read-only (code
+  # only, no egress) so the tap entrypoint runs without rebuilding the base
+  # attacker image, and the shared osdp_bus volume so it can open the same named
+  # pipes the vuln pd/cp already use. No ports: section is added here (SAFE-01
+  # containment unchanged); the fifo bus stays the same local named volume.
+  attacker:
+    working_dir: /app/lab/attacker
+    environment:
+      PYTHONPATH: /app/src
+    command: ["python", "fifo_tap.py"]
+    volumes:
+      - ./src:/app/src:ro
+      - ./lab:/app/lab:ro
       - osdp_bus:/busvol
 
 volumes:

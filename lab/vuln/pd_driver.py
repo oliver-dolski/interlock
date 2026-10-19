@@ -36,6 +36,13 @@ BUS_DEVICE = "/busvol/osdp_bus"
 # default, not a vendor production key (SAFE-03).
 SCBK_D = bytes(range(0x30, 0x40))
 
+# The single lock-state sentinel every door-open attack proves itself against (D-05),
+# mirrored here from lab/osdp/pd_driver.py's fixed-profile sentinel so the fifo bus
+# exposes the same oracle: fired unconditionally on every output command, regardless
+# of control_code - the oracle is the sentinel's appearance itself, not output
+# semantics (Pitfall 2 - this is the only lab instrumentation Task 1 adds here).
+_LOCK_STATE_SENTINEL = "interlock-lab: LOCK state=UNLOCKED"
+
 
 def _require_scenario() -> None:
     """Fail closed unless LAB_SCENARIO is exactly cve-replay (ASVS V5)."""
@@ -63,7 +70,15 @@ def _card_read_event() -> dict[str, object]:
 
 
 def _handle_command(command: dict[str, object]) -> dict[str, object]:
-    """Accept every command; the lab only needs the bus and SC to come up."""
+    """Accept every command; fire the single D-05 lock-state sentinel on CMD_OUT.
+
+    Mirrors the accept-everything command handler in ``lab/osdp/pd_driver.py``, adapted
+    to the v2.4.0 C-ext API's dict-keyed command type (``osdp.CMD_OUTPUT``) rather than
+    the fixed image's ``Command.Output`` enum. This is the only lab instrumentation
+    this task adds to the vuln PD, nothing else new.
+    """
+    if command.get("command") == osdp.CMD_OUTPUT:
+        print(_LOCK_STATE_SENTINEL, flush=True)
     return {"return_code": 0}
 
 
