@@ -15,6 +15,7 @@ present; this file currently holds only the Task 1 spike.
 from __future__ import annotations
 
 import base64
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -53,9 +54,20 @@ def test_fifo_tap_observes_cve_replay_bus_traffic(compose_up: ComposeUp) -> None
         "cve-replay: vuln PD never came online under the fifo-tap override"
     )
 
-    cp2pd = _read_capture(lab, "/app/capture/cp2pd.cap")
-    pd2cp = _read_capture(lab, "/app/capture/pd2cp.cap")
+    # The fifo tap is a deliberately low-frequency minority consumer (see fifo_tap.py): it
+    # accumulates captured bytes asynchronously and wins only a share of the races against the
+    # PD/CP's own 20ms loop, so a non-empty capture lags the PD-online edge by a few seconds.
+    # Sample with a bounded retry rather than once at the edge, where the tap may not yet have
+    # won a single read. Observed empirically: first bytes land within ~10s of online.
+    deadline = time.monotonic() + 60.0
+    cp2pd = pd2cp = b""
+    while time.monotonic() < deadline:
+        cp2pd = _read_capture(lab, "/app/capture/cp2pd.cap")
+        pd2cp = _read_capture(lab, "/app/capture/pd2cp.cap")
+        if cp2pd or pd2cp:
+            break
+        time.sleep(2.0)
     assert cp2pd or pd2cp, (
-        "cve-replay: fifo tap observed no traffic in either direction "
+        "cve-replay: fifo tap observed no traffic in either direction within 60s "
         "(expected at least one non-empty capture)"
     )
