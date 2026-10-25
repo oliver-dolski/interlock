@@ -38,18 +38,19 @@ services:
     volumes:
       - osdp_bus:/busvol
 
-  # Task 1 (ATK-05b wave-0 spike): re-home the attacker from the inherited, idle
-  # Phase 2 TCP proxy (the vuln CP never dials it over TCP) onto the cve-replay
-  # fifo bus via lab/attacker/fifo_tap.py. Mounts ./src and ./lab read-only (code
-  # only, no egress) so the tap entrypoint runs without rebuilding the base
-  # attacker image, and the shared osdp_bus volume so it can open the same named
-  # pipes the vuln pd/cp already use. No ports: section is added here (SAFE-01
-  # containment unchanged); the fifo bus stays the same local named volume.
+  # ATK-05b: re-home the attacker from the inherited, idle Phase 2 TCP proxy (the
+  # vuln CP never dials it over TCP) to sit INLINE on the cve-replay fifo bus via
+  # lab/attacker/fifo_relay.py - the CP talks to the relay, the relay talks to the
+  # PD (a passive tap would starve the PD, since a fifo has no broadcast mode).
+  # Mounts ./src and ./lab read-only (code only, no egress) so the relay entrypoint
+  # runs without rebuilding the base attacker image, and the shared osdp_bus volume
+  # so it can create the CP-side pipes and open the PD-side ones. No ports: section
+  # is added here (SAFE-01 containment unchanged); the buses stay local named volumes.
   attacker:
     working_dir: /app/lab/attacker
     environment:
       PYTHONPATH: /app/src
-    command: ["python", "fifo_tap.py"]
+    command: ["python", "fifo_relay.py"]
     volumes:
       - ./src:/app/src:ro
       - ./lab:/app/lab:ro

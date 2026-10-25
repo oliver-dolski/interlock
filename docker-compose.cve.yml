@@ -1,0 +1,34 @@
+# CVE-2024-52288 MITM override (ATK-05b, fixed-profile half of the matched pair): run
+# interlock's inline Secure Channel replay relay in the attacker position against the FIXED
+# libosdp v3.0.8 image over TCP. Layer it on the sc-scbkd scenario:
+#
+#   LAB_SCENARIO=sc-scbkd docker compose -f docker-compose.yml -f docker-compose.cve.yml up
+#
+# The relay (replay.py's cve_replay_transform, selected by ATTACK_MODE=cve) forwards the live
+# Secure Channel transparently until a trigger file arms it, then injects - in-band - the
+# out-of-sequence REPLY_RMAC_I (CVE-2024-52288) plus a forged unlock CMD_OUT. A fixed v3.0.8
+# core rejects the stale RMAC, so the PD lock-state signal (D-05) never flips: the "fix defeats
+# it" half of the matched pair. The vuln half runs on the fifo bus via docker-compose.vuln.yml.
+#
+# For the attacker service only, this mounts ./src read-only so the stdlib-only attack is
+# importable, sets PYTHONPATH, and replaces the command with the replay entrypoint. It adds no
+# ports and stays on the internal labnet, so SAFE-01 containment is unchanged.
+services:
+  # The CP issues one legitimate secure CMD_OUT and enforces Secure Channel; the PD inherits the
+  # same CVE_LAB marker for symmetry. CVE_LAB gates behaviour that must touch ONLY the cve
+  # profile, so every other scenario's bus stays byte-for-byte unchanged.
+  cp:
+    environment:
+      CVE_LAB: "1"
+  pd:
+    environment:
+      CVE_LAB: "1"
+  attacker:
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+      ATTACKER_UPSTREAM: ${ATTACKER_UPSTREAM:-pd:10000}
+      ATTACK_MODE: cve
+    command: ["python", "-m", "interlock.osdp.attacks.replay"]
+    volumes:
+      - ./src:/app/src:ro

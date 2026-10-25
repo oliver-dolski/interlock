@@ -28,7 +28,7 @@ ONLINE_TIMEOUT_SECONDS = 30.0
 REFRESH_INTERVAL_SECONDS = 0.02
 
 # The shared-volume fifo the CP connects to; the PD (server) creates <device>-0/-1.
-BUS_DEVICE = "/busvol/osdp_bus"
+BUS_DEVICE = "/busvol/pd_bus"
 
 # OSDP specification default Secure Channel Base Key (SCBK-D), bytes 0x30..0x3F.
 # Same value as lab/osdp/scenarios.SCBK_D, duplicated here on purpose: the vuln
