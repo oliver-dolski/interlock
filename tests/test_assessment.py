@@ -966,6 +966,10 @@ def test_replay_of_the_live_card_read_is_vulnerable(lab_dir: Path) -> None:
     result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
     assert result.status is Status.VULNERABLE
     assert _finding_ids(result) == {"ATK-05a-replay-card-exchange"}
+    # The finding never claims a live byte-exact re-injection without the method beside it.
+    [finding] = result.findings
+    assert finding.evidence.endswith(assessment.REPLAY_LIVE_NOTE)
+    assert "shared POLL-to-CMD_OUT rewrite" in finding.evidence
     assert _bring_ups(fake) == [("cleartext", ("docker-compose.replay.yml",))]
     assert _touch_argv(lab_dir, "docker-compose.replay.yml", _REPLAY_TRIGGER) in fake.argvs
     assert fake.touches == [_REPLAY_TRIGGER]
@@ -1098,3 +1102,151 @@ def test_assessment_reads_no_fixture_and_imports_nothing_physical() -> None:
     for name in imported:
         assert not any(part in name for part in _FORBIDDEN_IMPORT_PARTS), name
         assert name != "tests" and not name.startswith("tests."), name
+
+
+# --- The full report a reader opens (05-06) ----------------------------------------------------
+
+_ALL_ATTACKS = (
+    "sniff",
+    "enumerate",
+    "fuzz",
+    "weak-key",
+    "keyset",
+    "downgrade",
+    "spoof",
+    "replay",
+    "cve-2024-52288",
+)
+_LONG_DASHES = (chr(0x2014), chr(0x2013))
+_GENERATED_AT = "2026-10-26T00:00:00+00:00"
+
+
+def _full_run(lab_dir: Path, fake: FakeCompose, out: Path) -> tuple[str, dict[str, object]]:
+    """Run all seven real steps over ``fake`` and return the Markdown text and the JSON."""
+    results = _run_steps(lab_dir, fake, *(step.key for step in STEPS))
+    md_path = out / "assessment.md"
+    json_path = write_reports(results, md_path, generated_at=_GENERATED_AT)
+    markdown = md_path.read_text(encoding="utf-8")
+    raw = json_path.read_text(encoding="utf-8")
+    for dash in _LONG_DASHES:
+        assert dash not in markdown
+        assert dash not in raw
+    assert len(raw.encode("utf-8")) < 64 * 1024, "the JSON carries more than findings and metadata"
+    return markdown, json.loads(raw)
+
+
+def _section(markdown: str, heading: str) -> list[str]:
+    """Return the lines of the ``## heading`` section, up to the next ``## `` heading."""
+    lines = markdown.splitlines()
+    start = lines.index(f"## {heading}") + 1
+    end = next((i for i in range(start, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return lines[start:end]
+
+
+def _coverage_rows(markdown: str) -> dict[str, list[str]]:
+    """Return the Coverage table as attack key -> its cells."""
+    rows = [line for line in _section(markdown, "Coverage") if line.startswith("| ")]
+    header, *body = rows
+    assert header == "| Attack | Step | Result | Enterprise | ICS |"
+    cells = [[cell.strip() for cell in row.strip("|").split("|")] for row in body]
+    return {row[0]: row for row in cells}
+
+
+def test_full_report_reads_as_an_attack_mapped_assessment(tmp_path: Path, lab_dir: Path) -> None:
+    markdown, document = _full_run(lab_dir, FakeCompose(), tmp_path / "out")
+
+    assert markdown.startswith("# interlock OSDP assessment\n\n" + report.AUTHORIZED_USE_NOTICE)
+    headings = [line for line in markdown.splitlines() if line.startswith("## ")]
+    order = ["Scope", "Summary", "Coverage", "Findings", "Checks without a finding", "Method notes"]
+    positions = [headings.index(f"## {name}") for name in order]
+    assert positions == sorted(positions)
+
+    scope = "\n".join(_section(markdown, "Scope"))
+    assert "network-isolated lab" in scope
+    assert "interlock-assess" in scope
+    assert "cleartext, sc-scbkd, downgrade" in scope
+    assert "LibOSDP 3.0.8 (fixed)" in scope
+    assert "CVE-2024-52288 core is not part of the default run" in scope
+    assert "MITRE ATT&CK v20.0" in scope
+    assert "T1200 (Hardware Additions)" in scope
+    assert _GENERATED_AT in scope
+
+    summary = _section(markdown, "Summary")
+    assert "| Severity | Findings |" in summary
+    severities = [line.split("|")[1].strip() for line in summary if line.startswith("| ")][1:6]
+    assert severities == ["critical", "high", "medium", "low", "info"]
+    assert "### Steps" in summary
+
+    rows = _coverage_rows(markdown)
+    assert sorted(rows) == sorted(_ALL_ATTACKS)
+    assert rows["downgrade"][1:] == [
+        "downgrade",
+        "ATK-03-downgrade",
+        "T1689 (Downgrade Attack)",
+        "T0830 (Adversary-in-the-Middle)",
+    ]
+    assert rows["fuzz"][2] == "no finding"
+    assert rows["cve-2024-52288"][1:3] == ["cve-2024-52288-fixed", "no finding"]
+    assert rows["sniff"][2] == "ATK-01-sniff-pd-101"
+    assert rows["replay"][2] == "ATK-05a-replay-card-exchange"
+
+    # Every finding names its techniques "ID (Name)".
+    assert "- **ATT&CK technique:** T1689 (Downgrade Attack)" in markdown
+    assert "- **ATT&CK for ICS:** T0830 (Adversary-in-the-Middle)" in markdown
+
+    checks = _section(markdown, "Checks without a finding")
+    assert any(line.startswith("- fuzz (not_vulnerable): ") for line in checks)
+    assert any(line.startswith("- cve-2024-52288-fixed (not_vulnerable): ") for line in checks)
+    notes = "\n".join(_section(markdown, "Method notes"))
+    for step in STEPS:
+        assert f"- {step.key}: {step.method}" in notes
+    assert "live proof via the in-path relay" in notes
+    replay_section = markdown.split("## ATK-05a-replay-card-exchange:")[1].split("\n## ")[0]
+    assert assessment.REPLAY_LIVE_NOTE in replay_section
+    assert "byte-exact" in notes
+
+    assert document["attack_version"] == "20.0"
+    assert document["access_vector"] == {"enterprise": "T1200", "name": "Hardware Additions"}
+    coverage = document["coverage"]
+    assert isinstance(coverage, list) and len(coverage) == 9
+    assert [entry["attack"] for entry in coverage] == list(_ALL_ATTACKS)
+    downgrade_entry = next(entry for entry in coverage if entry["attack"] == "downgrade")
+    assert downgrade_entry == {
+        "attack": "downgrade",
+        "step": "downgrade",
+        "result": "ATK-03-downgrade",
+        "finding_ids": ["ATK-03-downgrade"],
+        "enterprise": "T1689",
+        "ics": "T0830",
+    }
+    steps = document["steps"]
+    assert isinstance(steps, list) and len(steps) == 7
+    assert all(step["method"] for step in steps)
+
+
+def test_an_inconclusive_step_shows_in_coverage_and_in_the_appendix(
+    tmp_path: Path, lab_dir: Path
+) -> None:
+    fake = FakeCompose(
+        bring_up_captures={
+            ("downgrade", _TAP): _fixture_pair("cleartext"),
+            ("downgrade", _DOWNGRADE): _fixture_pair("cleartext"),
+        }
+    )
+    markdown, document = _full_run(lab_dir, fake, tmp_path / "out")
+
+    assert _coverage_rows(markdown)["downgrade"][2] == "inconclusive"
+    checks = _section(markdown, "Checks without a finding")
+    assert "- downgrade (inconclusive): baseline was not Secure Channel" in checks
+    coverage = document["coverage"]
+    assert isinstance(coverage, list)
+    entry = next(entry for entry in coverage if entry["attack"] == "downgrade")
+    assert entry["result"] == "inconclusive" and entry["finding_ids"] == []
+    # The other steps' findings are unaffected.
+    assert _coverage_rows(markdown)["spoof"][2] == "ATK-08-spoof-unlock"
+
+
+def test_coverage_marks_an_attack_whose_step_never_ran() -> None:
+    rows = assessment.coverage([])
+    assert len(rows) == 9
+    assert {row.result for row in rows} == {"not run"}

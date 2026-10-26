@@ -31,7 +31,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from rich.console import Console
@@ -39,7 +39,7 @@ from rich.table import Table
 
 import interlock
 from interlock import report
-from interlock.osdp import constants, lab_session, secure_channel
+from interlock.osdp import attack_map, constants, lab_session, secure_channel
 from interlock.osdp.attacks import downgrade, replay, spoof
 from interlock.osdp.attacks.enumerate import run_enumerate
 from interlock.osdp.attacks.fuzz import LIBOSDP_REJECTION_MARKERS
@@ -50,7 +50,7 @@ from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.lab_session import LabError, LabSession
 from interlock.osdp.tap_capture import CP2PD_PATH, PD2CP_PATH
 from interlock.osdp.transport import Direction
-from interlock.plugin import Finding, finding_from_dict
+from interlock.plugin import Finding, Severity, finding_from_dict
 
 _console = Console()
 
@@ -396,6 +396,15 @@ _REPLAY_PROFILE = "cleartext"
 _REPLAY_OVERRIDES = ("docker-compose.replay.yml",)
 
 
+# The replay verdict's evidence describes the byte-exact re-injection; in this run the live
+# unlock came through the shared relay rewrite, so the finding says so next to its evidence.
+REPLAY_LIVE_NOTE = (
+    "Assessment run: the live unlock was triggered through the in-path relay's shared "
+    "POLL-to-CMD_OUT rewrite on the replay trigger; the byte-exact re-injection of the "
+    "captured REPLY_RAW is proven by host unit tests, not on the live bus."
+)
+
+
 def _replay(session: LabSession, context: dict[str, object]) -> StepOutput:
     """Replay the card read captured live by sniff-enumerate and watch the PD's lock state."""
     frames = context.get("cleartext_frames")
@@ -413,7 +422,10 @@ def _replay(session: LabSession, context: dict[str, object]) -> StepOutput:
         )
     if findings:
         return StepOutput(
-            findings=tuple(findings),
+            findings=tuple(
+                replace(finding, evidence=f"{finding.evidence} {REPLAY_LIVE_NOTE}")
+                for finding in findings
+            ),
             detail=(
                 f"{len(captured)} card read(s) captured live; the PD was locked before arming "
                 "and logged UNLOCKED after"
@@ -664,12 +676,167 @@ def _row(result: StepResult) -> tuple[str, str, str, str, str]:
 
 
 def _steps_table(results: Sequence[StepResult]) -> list[str]:
-    """Return the Markdown "## Steps" section summarising every step."""
-    lines = ["## Steps", "", "| " + " | ".join(_COLUMNS) + " |", "|" + "---|" * len(_COLUMNS)]
+    """Return the Markdown "### Steps" table summarising every step."""
+    lines = ["### Steps", "", "| " + " | ".join(_COLUMNS) + " |", "|" + "---|" * len(_COLUMNS)]
     for result in results:
         lines.append("| " + " | ".join(_row(result)) + " |")
     lines.append("")
     return lines
+
+
+# Highest severity first, as a reader triages.
+_SEVERITY_ORDER = (
+    Severity.CRITICAL,
+    Severity.HIGH,
+    Severity.MEDIUM,
+    Severity.LOW,
+    Severity.INFO,
+)
+_COMPLETED = {Status.VULNERABLE, Status.NOT_VULNERABLE}
+_NO_FINDING = "no finding"
+_NOT_RUN = "not run"
+_ACCESS_VECTOR_REASON = (
+    "every bus attack presumes a device inserted on the RS-485 segment; no ICS technique "
+    "fits better"
+)
+
+
+def _named(technique_id: str | None, name: str | None) -> str:
+    """Return "ID (Name)", or "-" when the attack has no technique in that matrix."""
+    if technique_id is None:
+        return "-"
+    return f"{technique_id} ({name})" if name else technique_id
+
+
+@dataclass(frozen=True)
+class CoverageRow:
+    """One attack's outcome: the step that ran it, its finding ids or the step's status."""
+
+    attack: str
+    step: str
+    result: str
+    finding_ids: tuple[str, ...]
+    technique: attack_map.Technique
+
+
+def coverage(results: Sequence[StepResult], steps: Sequence[Step] = STEPS) -> list[CoverageRow]:
+    """Return one row per (attack key, finding-id prefix) of ``steps``, in run order.
+
+    The result is the comma-joined finding ids carrying the attack's prefix; "no finding" when
+    the step completed without one; otherwise the step's own status (inconclusive or error),
+    so a negative is never hidden inside a vulnerable step. An attack whose step is absent
+    from ``results`` reads "not run".
+    """
+    by_key = {result.key: result for result in results}
+    rows: list[CoverageRow] = []
+    for step in steps:
+        result = by_key.get(step.key)
+        for attack, prefix in step.attacks:
+            ids: tuple[str, ...] = ()
+            if result is None:
+                outcome = _NOT_RUN
+            else:
+                ids = tuple(f.id for f in result.findings if f.id.startswith(prefix))
+                if ids:
+                    outcome = ", ".join(ids)
+                elif result.status in _COMPLETED:
+                    outcome = _NO_FINDING
+                else:
+                    outcome = result.status.value
+            rows.append(CoverageRow(attack, step.key, outcome, ids, attack_map.MAPPINGS[attack]))
+    return rows
+
+
+def _scope(results: Sequence[StepResult], generated_at: str) -> list[str]:
+    profiles = ", ".join(dict.fromkeys(result.profile for result in results)) or "none"
+    vector = _named(attack_map.ACCESS_VECTOR.enterprise, attack_map.ACCESS_VECTOR.enterprise_name)
+    target = (
+        "the bundled, network-isolated lab (no published ports), compose project "
+        f"{lab_session.DEFAULT_PROJECT}; no real hardware is reachable from the assessment"
+    )
+    core = (
+        "LibOSDP 3.0.8 (fixed); the pinned-vulnerable CVE-2024-52288 core is not part of the "
+        "default run"
+    )
+    framework = (
+        f"MITRE ATT&CK v{attack_map.ATTACK_VERSION}: Enterprise primary, ICS secondary where a "
+        "technique fits"
+    )
+    return [
+        "## Scope",
+        "",
+        f"- **Target:** {target}.",
+        f"- **Profiles run:** {profiles}",
+        f"- **Core under test:** {core}.",
+        f"- **Framework:** {framework}.",
+        f"- **Access vector:** {vector}, engagement-level: {_ACCESS_VECTOR_REASON}.",
+        f"- **Generated at:** {generated_at}",
+        "",
+    ]
+
+
+def _summary(results: Sequence[StepResult]) -> list[str]:
+    counts = {severity: 0 for severity in _SEVERITY_ORDER}
+    for result in results:
+        for finding in result.findings:
+            counts[finding.severity] += 1
+    lines = [
+        "## Summary",
+        "",
+        "| Severity | Findings |",
+        "|---|---|",
+        *(f"| {severity.value} | {count} |" for severity, count in counts.items()),
+        "",
+    ]
+    return lines + _steps_table(results)
+
+
+_COVERAGE_COLUMNS = ("Attack", "Step", "Result", "Enterprise", "ICS")
+
+
+def _coverage_table(rows: Sequence[CoverageRow]) -> list[str]:
+    lines = [
+        "## Coverage",
+        "",
+        "| " + " | ".join(_COVERAGE_COLUMNS) + " |",
+        "|" + "---|" * len(_COVERAGE_COLUMNS),
+    ]
+    for row in rows:
+        technique = row.technique
+        cells = (
+            row.attack,
+            row.step,
+            row.result,
+            _named(technique.enterprise, technique.enterprise_name),
+            _named(technique.ics, technique.ics_name),
+        )
+        lines.append("| " + " | ".join(cells) + " |")
+    lines.append("")
+    return lines
+
+
+def _appendix(results: Sequence[StepResult]) -> list[str]:
+    lines = ["## Checks without a finding", ""]
+    clean = [result for result in results if not result.findings]
+    lines.extend(f"- {r.key} ({r.status.value}): {r.detail}" for r in clean)
+    if not clean:
+        lines.append("- none: every step produced at least one finding")
+    lines += ["", "## Method notes", ""]
+    lines.extend(f"- {result.key}: {result.method}" for result in results)
+    lines.append("")
+    return lines
+
+
+def _coverage_dict(row: CoverageRow) -> dict[str, object]:
+    technique = row.technique
+    return {
+        "attack": row.attack,
+        "step": row.step,
+        "result": row.result,
+        "finding_ids": list(row.finding_ids),
+        "enterprise": technique.enterprise,
+        "ics": technique.ics,
+    }
 
 
 def _step_dict(result: StepResult) -> dict[str, object]:
@@ -689,16 +856,30 @@ def _step_dict(result: StepResult) -> dict[str, object]:
 def write_reports(results: Sequence[StepResult], md_path: Path, *, generated_at: str) -> Path:
     """Write the Markdown report to ``md_path`` and the JSON next to it; return the JSON path.
 
-    Findings appear in step order. Neither report carries raw capture bytes or tracebacks.
+    The Markdown reads: title and authorized-use notice, Scope (lab target, profiles, core,
+    ATT&CK version, access vector), Summary (severity counts, step table), Coverage (every
+    attack's result and techniques), Findings in step order with "ID (Name)" techniques, then
+    the checks without a finding and every step's method note. The JSON mirrors it for CI.
+    Neither report carries raw capture bytes, tracebacks or environment data.
     """
     findings = [finding for result in results for finding in result.findings]
+    rows = coverage(results)
     report.write_markdown(
         findings,
         md_path,
         title=REPORT_TITLE,
-        preamble=_steps_table(results),
+        preamble=[
+            *_scope(results, generated_at),
+            *_summary(results),
+            *_coverage_table(rows),
+            "## Findings",
+            "",
+        ],
+        appendix=_appendix(results),
+        technique_names=attack_map.technique_names(),
     )
     json_path = md_path.with_suffix(".json")
+    vector = attack_map.ACCESS_VECTOR
     report.write_json(
         findings,
         json_path,
@@ -706,6 +887,9 @@ def write_reports(results: Sequence[StepResult], md_path: Path, *, generated_at:
             "tool": {"name": "interlock", "version": interlock.__version__},
             "generated_at": generated_at,
             "target": {"kind": "lab", "project": lab_session.DEFAULT_PROJECT},
+            "attack_version": attack_map.ATTACK_VERSION,
+            "access_vector": {"enterprise": vector.enterprise, "name": vector.enterprise_name},
+            "coverage": [_coverage_dict(row) for row in rows],
             "steps": [_step_dict(result) for result in results],
         },
     )
