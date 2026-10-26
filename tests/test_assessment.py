@@ -1,18 +1,21 @@
 """Host proof of ``interlock osdp assess`` and its orchestrator (ASSESS-01, no Docker).
 
 A scripted fake compose runner is this plan's lab simulator: it records every (argv, env) it is
-handed and answers by subcommand, ``up``/``down`` with exit 0, ``logs`` with both cp sentinels
-and ``exec ... python -c <reader> <path>`` with the base64 of the committed cleartext tap capture
-for that direction (chosen by the path's basename). Tests may read the fixtures; code under
-src/ never does. ``lab_session.make_runner`` and ``lab_session.docker_available`` are
+handed and answers by subcommand, ``up``/``down`` with exit 0, ``logs <service>`` with that
+service's healthy-lab sentinels, ``exec ... python -c <reader> <path>`` with the base64 of the
+committed cleartext tap capture for that direction (chosen by the path's basename) and the
+in-container fuzz sweep with its canned stdout. Tests may read the fixtures; code under src/
+never does. ``lab_session.make_runner`` and ``lab_session.docker_available`` are
 monkeypatched, so the real CLI runs end to end through the real ``LabSession``.
 """
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -24,23 +27,36 @@ from interlock import report
 from interlock.cli import app
 from interlock.osdp import lab_session
 from interlock.osdp.assessment import (
+    _FUZZ_SCRIPT,
+    STEPS,
     Inconclusive,
     Status,
     Step,
     StepOutput,
     StepResult,
     exit_code,
+    required_files,
     run_assessment,
     write_reports,
 )
 from interlock.osdp.lab_session import LabSession
-from interlock.plugin import Finding, Severity
+from interlock.plugin import Finding, Severity, finding_to_dict
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "osdp" / "fixtures"
 
 _PD_ONLINE = "interlock-lab: PD 101 online"
 _EVENT = "interlock-lab: event received"
 _CP_LOG = f"cp-1  | {_PD_ONLINE}\ncp-1  | {_EVENT}\n"
+_PD_LISTENING = "interlock-lab: PD listening on 0.0.0.0:10000"
+# A healthy PD under the fuzz sweep: listening, then one LibOSDP parser-rejection line.
+_PD_REJECTED = "pd-1  | OSDP: PD: Invalid CRC 0x1234; expected 0x5678\n"
+_PD_LOG = f"pd-1  | {_PD_LISTENING}\n{_PD_REJECTED}"
+
+# The healthy-lab log per service; tests override single services.
+_LOGS = {"cp": _CP_LOG, "pd": _PD_LOG}
+
+# The in-container fuzz sweep on a healthy PD: no finding, completion reported.
+_FUZZ_CLEAN = "INTERLOCK-FUZZ-DONE 0\n"
 
 # The live tap capture per in-container basename, from the committed cleartext fixtures.
 _CAPTURES = {
@@ -66,21 +82,27 @@ def _subcommand(argv: Sequence[str]) -> str:
 class FakeCompose:
     """A recording ``Runner`` that simulates the lab per compose subcommand.
 
-    ``returncodes`` and ``logs`` override the answer per subcommand; ``captures`` overrides
-    the bytes returned for a capture basename (b"" simulates an empty capture).
+    ``returncodes`` overrides the exit code per subcommand; ``logs`` overrides the log text
+    per service; ``captures`` overrides the bytes returned for a capture basename (b""
+    simulates an empty capture); ``fuzz_stdout`` and ``fuzz_returncode`` script the
+    in-container fuzz sweep.
     """
 
     def __init__(
         self,
         *,
         returncodes: Mapping[str, int] | None = None,
-        logs: str = _CP_LOG,
+        logs: Mapping[str, str] | None = None,
         captures: Mapping[str, bytes] | None = None,
+        fuzz_stdout: str = _FUZZ_CLEAN,
+        fuzz_returncode: int = 0,
     ) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.returncodes = dict(returncodes or {})
-        self.logs = logs
+        self.logs = {**_LOGS, **(logs or {})}
         self.captures = {**_CAPTURES, **(captures or {})}
+        self.fuzz_stdout = fuzz_stdout
+        self.fuzz_returncode = fuzz_returncode
 
     @property
     def argvs(self) -> list[list[str]]:
@@ -92,13 +114,16 @@ class FakeCompose:
         argv = list(argv)
         self.calls.append((argv, dict(env)))
         sub = _subcommand(argv)
+        returncode = self.returncodes.get(sub, 0)
         if sub == "logs":
-            stdout = self.logs
+            stdout = self.logs.get(argv[-1], "")
+        elif sub == "exec" and _FUZZ_SCRIPT in argv:
+            stdout, returncode = self.fuzz_stdout, self.fuzz_returncode
         elif sub == "exec":
             stdout = base64.b64encode(self.captures[PurePosixPath(argv[-1]).name]).decode()
         else:
             stdout = ""
-        return subprocess.CompletedProcess(argv, self.returncodes.get(sub, 0), stdout, "")
+        return subprocess.CompletedProcess(argv, returncode, stdout, "")
 
 
 def _base(lab: Path, *overrides: str) -> list[str]:
@@ -108,12 +133,27 @@ def _base(lab: Path, *overrides: str) -> list[str]:
     return ["docker", "compose", "-p", "interlock-assess", *files]
 
 
+def _overrides(argv: Sequence[str]) -> tuple[str, ...]:
+    """Return the override file names of a compose argv (every -f after the base file)."""
+    files = [PurePosixPath(argv[i + 1]).name for i, token in enumerate(argv) if token == "-f"]
+    return tuple(files[1:])
+
+
+def _bring_ups(fake: FakeCompose) -> list[tuple[str, tuple[str, ...]]]:
+    """Return (LAB_SCENARIO, overrides) for every ``up`` the fake saw, in order."""
+    return [
+        (env["LAB_SCENARIO"], _overrides(argv))
+        for argv, env in fake.calls
+        if _subcommand(argv) == "up"
+    ]
+
+
 @pytest.fixture
 def lab_dir(tmp_path: Path) -> Path:
     """A lab dir holding (empty) copies of the compose files the assessment requires."""
     lab = tmp_path / "lab"
     lab.mkdir()
-    for name in ("docker-compose.yml", "docker-compose.tap.yml"):
+    for name in required_files():
         (lab / name).write_text("", encoding="utf-8")
     return lab.resolve()
 
@@ -127,7 +167,18 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeCompose:
     return compose
 
 
-def test_assess_runs_sniff_enumerate_end_to_end(
+# What the default FakeCompose (a healthy lab) yields per step, and the bring-ups it sees.
+_HEALTHY_LAB_STATUSES = {
+    "sniff-enumerate": "vulnerable",
+    "fuzz": "not_vulnerable",
+}
+_HEALTHY_LAB_BRING_UPS = [
+    ("cleartext", ("docker-compose.tap.yml",)),
+    ("cleartext", ("docker-compose.fuzz.yml",)),
+]
+
+
+def test_assess_runs_every_step_end_to_end(
     tmp_path: Path, lab_dir: Path, fake: FakeCompose
 ) -> None:
     md_path = tmp_path / "out" / "assessment.md"
@@ -153,13 +204,24 @@ def test_assess_runs_sniff_enumerate_end_to_end(
     assert step["status"] == "vulnerable"
     assert {"ATK-01-sniff-pd-101", "ATK-02-enumerate-pd-101"} <= set(step["finding_ids"])
 
-    # Reset first, then the exact tap bring-up, and a final teardown for the same stack.
+    statuses = {step["key"]: step["status"] for step in document["steps"]}
+    assert statuses == _HEALTHY_LAB_STATUSES
+
+    # Reset first, then every bring-up in step order, each torn down before the next.
     tap = _base(lab_dir, "docker-compose.tap.yml")
     assert fake.argvs[0] == [*_base(lab_dir), "down", "-v"]
     assert fake.argvs[1] == [*tap, "up", "-d", "--build", "--force-recreate"]
     assert fake.calls[1][1]["LAB_SCENARIO"] == "cleartext"
-    assert fake.argvs[-1] == [*tap, "down", "-v"]
-    reads = [argv[-1] for argv in fake.argvs if _subcommand(argv) == "exec"]
+    assert _bring_ups(fake) == _HEALTHY_LAB_BRING_UPS
+    ups_and_downs = [argv for argv in fake.argvs[1:] if _subcommand(argv) in {"up", "down"}]
+    for up, down in zip(ups_and_downs[::2], ups_and_downs[1::2], strict=True):
+        assert up[-4:] == ["up", "-d", "--build", "--force-recreate"]
+        assert down == [*up[:-4], "down", "-v"]
+    reads = [
+        argv[-1]
+        for argv in fake.argvs[: fake.argvs.index([*tap, "down", "-v"])]
+        if _subcommand(argv) == "exec"
+    ]
     assert reads == ["/app/capture/cp2pd.cap", "/app/capture/pd2cp.cap"]
 
 
@@ -392,6 +454,22 @@ class FakeClock:
         self.now += seconds
 
 
+def _steps(*keys: str) -> tuple[Step, ...]:
+    """Return the real ``STEPS`` entries named by ``keys``, in the order given."""
+    by_key = {step.key: step for step in STEPS}
+    return tuple(by_key[key] for key in keys)
+
+
+def _run_steps(lab_dir: Path, fake: FakeCompose, *keys: str) -> list[StepResult]:
+    """Run the named real steps over ``fake`` on a fake clock (no wait ever really sleeps)."""
+    clock = FakeClock()
+    session = LabSession(lab_dir, runner=fake, sleep=clock.sleep, clock=clock)
+    started = time.monotonic()
+    results = run_assessment(session, steps=_steps(*keys), clock=clock)
+    assert time.monotonic() - started < 10.0
+    return results
+
+
 @pytest.mark.parametrize(
     ("logs", "missing"),
     [
@@ -403,11 +481,11 @@ def test_sniff_enumerate_times_out_as_inconclusive_without_real_sleeping(
     lab_dir: Path, logs: str, missing: str
 ) -> None:
     clock = FakeClock()
-    fake = FakeCompose(logs=logs)
+    fake = FakeCompose(logs={"cp": logs})
     session = LabSession(lab_dir, runner=fake, sleep=clock.sleep, clock=clock)
 
     started = time.monotonic()
-    results = run_assessment(session, clock=clock)
+    results = run_assessment(session, steps=_steps("sniff-enumerate"), clock=clock)
     assert time.monotonic() - started < 10.0
 
     assert results[0].status is Status.INCONCLUSIVE
@@ -422,7 +500,7 @@ def test_sniff_enumerate_with_an_empty_capture_is_inconclusive(
     lab_dir: Path, basename: str
 ) -> None:
     fake = FakeCompose(captures={basename: b""})
-    results = run_assessment(LabSession(lab_dir, runner=fake))
+    results = run_assessment(LabSession(lab_dir, runner=fake), steps=_steps("sniff-enumerate"))
     assert results[0].status is Status.INCONCLUSIVE
     assert "empty" in results[0].detail
     assert results[0].findings == ()
@@ -439,7 +517,142 @@ def test_sniff_enumerate_lab_error_is_mapped_to_error(
     lab_dir: Path, failing: str, message: str
 ) -> None:
     fake = FakeCompose(returncodes={failing: 1})
-    results = run_assessment(LabSession(lab_dir, runner=fake))
+    results = run_assessment(LabSession(lab_dir, runner=fake), steps=_steps("sniff-enumerate"))
     assert results[0].status is Status.ERROR
     assert results[0].detail.startswith(message)
     assert fake.argvs[-1][-2:] == ["down", "-v"]
+
+
+# ---------------------------------------------------------------------------------------------
+# The fuzz step: the in-container sweep's prefixed lines are the only trusted output.
+
+_FUZZ_FINDING = Finding(
+    id="ATK-07-fuzz-bad-crc",
+    title="PD stopped answering after a corrupted CRC",
+    severity=Severity.HIGH,
+    evidence="no reply to the follow-up valid poll",
+    attack_technique="T0806",
+    remediation="harden the parser",
+)
+
+
+def _finding_line(document: Mapping[str, object]) -> str:
+    return "INTERLOCK-FINDING " + json.dumps(document) + "\n"
+
+
+def test_steps_start_with_sniff_enumerate_then_fuzz_under_the_fuzz_override() -> None:
+    assert STEPS[0].key == "sniff-enumerate"
+    assert STEPS[1].key == "fuzz"
+    assert STEPS[1].profile == "cleartext"
+    assert STEPS[1].overrides == ("docker-compose.fuzz.yml",)
+    assert STEPS[1].attacks == (("fuzz", "ATK-07-fuzz-"),)
+
+
+def test_fuzz_on_a_healthy_pd_is_not_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose()
+    [result] = _run_steps(lab_dir, fake, "fuzz")
+    assert result.status is Status.NOT_VULNERABLE
+    assert result.detail == (
+        "baseline poll answered; all nine corruptions handled; the PD answered every "
+        "follow-up poll"
+    )
+    assert _bring_ups(fake) == [("cleartext", ("docker-compose.fuzz.yml",))]
+    fuzz_runs = [argv for argv in fake.argvs if _FUZZ_SCRIPT in argv]
+    assert len(fuzz_runs) == 1
+    fuzz_base = _base(lab_dir, "docker-compose.fuzz.yml")
+    assert fuzz_runs[0] == [
+        *fuzz_base,
+        "exec", "-T", "-e", "PYTHONPATH=/app/src", "attacker", "python", "-c", _FUZZ_SCRIPT,
+    ]
+    assert fake.argvs[-1] == [*fuzz_base, "down", "-v"]
+
+
+def test_fuzz_with_one_finding_line_is_vulnerable_with_that_id(lab_dir: Path) -> None:
+    stdout = _finding_line(finding_to_dict(_FUZZ_FINDING)) + "INTERLOCK-FUZZ-DONE 1\n"
+    [result] = _run_steps(lab_dir, FakeCompose(fuzz_stdout=stdout), "fuzz")
+    assert result.status is Status.VULNERABLE
+    assert result.findings == (_FUZZ_FINDING,)
+
+
+def test_fuzz_baseline_failure_is_inconclusive(lab_dir: Path) -> None:
+    stdout = "INTERLOCK-INCONCLUSIVE the PD did not answer the baseline poll\n"
+    [result] = _run_steps(lab_dir, FakeCompose(fuzz_stdout=stdout), "fuzz")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "the PD did not answer the baseline poll"
+
+
+def test_fuzz_finding_with_an_unknown_severity_is_an_error(lab_dir: Path) -> None:
+    document = {**finding_to_dict(_FUZZ_FINDING), "severity": "urgent"}
+    stdout = _finding_line(document) + "INTERLOCK-FUZZ-DONE 1\n"
+    [result] = _run_steps(lab_dir, FakeCompose(fuzz_stdout=stdout), "fuzz")
+    assert result.status is Status.ERROR
+    assert result.detail == "ValueError: unknown finding severity: 'urgent'"
+    assert result.findings == ()
+
+
+def test_fuzz_ignores_every_line_without_the_exact_prefix(lab_dir: Path) -> None:
+    document = json.dumps(finding_to_dict(_FUZZ_FINDING))
+    stdout = (
+        "starting sweep\n"
+        f"{document}\n"
+        f"FINDING {document}\n"
+        f" INTERLOCK-FINDING {document}\n"
+        f"interlock-finding {document}\n"
+        "INTERLOCK-FUZZ-DONE 0\n"
+    )
+    [result] = _run_steps(lab_dir, FakeCompose(fuzz_stdout=stdout), "fuzz")
+    assert result.status is Status.NOT_VULNERABLE
+    assert result.findings == ()
+
+
+def test_fuzz_completion_count_must_match_the_parsed_findings(lab_dir: Path) -> None:
+    stdout = _finding_line(finding_to_dict(_FUZZ_FINDING)) + "INTERLOCK-FUZZ-DONE 2\n"
+    [result] = _run_steps(lab_dir, FakeCompose(fuzz_stdout=stdout), "fuzz")
+    assert result.status is Status.ERROR
+    assert result.detail.startswith("ValueError: the fuzz sweep reported 2 findings")
+    assert result.findings == ()
+
+
+def test_fuzz_without_a_completion_line_is_inconclusive(lab_dir: Path) -> None:
+    stdout = _finding_line(finding_to_dict(_FUZZ_FINDING))
+    [result] = _run_steps(lab_dir, FakeCompose(fuzz_stdout=stdout), "fuzz")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "fuzz sweep did not report completion"
+
+
+def test_fuzz_clean_sweep_without_a_pd_rejection_line_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(logs={"pd": f"pd-1  | {_PD_LISTENING}\n"})
+    [result] = _run_steps(lab_dir, fake, "fuzz")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "the corruptions never reached the PD parser"
+
+
+def test_fuzz_waits_for_the_pd_to_listen_before_sweeping(lab_dir: Path) -> None:
+    fake = FakeCompose(logs={"pd": "pd-1  | interlock-lab: starting\n"})
+    [result] = _run_steps(lab_dir, fake, "fuzz")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "PD listening not observed in the pd log within 120 s"
+    assert not [argv for argv in fake.argvs if _FUZZ_SCRIPT in argv]
+    assert fake.argvs[-1][-2:] == ["down", "-v"]
+
+
+def test_fuzz_sweep_exiting_non_zero_is_an_error_with_the_output_tail(lab_dir: Path) -> None:
+    fake = FakeCompose(fuzz_stdout="Traceback: ModuleNotFoundError\n", fuzz_returncode=1)
+    [result] = _run_steps(lab_dir, fake, "fuzz")
+    assert result.status is Status.ERROR
+    assert result.detail.startswith("LabError: the fuzz sweep in the attacker failed (exit 1)")
+    assert "ModuleNotFoundError" in result.detail
+    assert fake.argvs[-1][-2:] == ["down", "-v"]
+
+
+def test_fuzz_script_imports_only_stdlib_plugin_and_fuzz() -> None:
+    allowed = {"interlock.plugin", "interlock.osdp.attacks.fuzz"}
+    imported: list[str] = []
+    for node in ast.walk(ast.parse(_FUZZ_SCRIPT)):
+        if isinstance(node, ast.Import):
+            imported += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+    assert imported, "the scan found no imports at all"
+    for name in imported:
+        assert name in allowed or name.split(".")[0] in sys.stdlib_module_names, name

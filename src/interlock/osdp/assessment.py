@@ -25,6 +25,8 @@ from a live capture or a live oracle.
 from __future__ import annotations
 
 import enum
+import json
+import subprocess
 import sys
 import time
 import traceback
@@ -39,11 +41,12 @@ import interlock
 from interlock import report
 from interlock.osdp import lab_session
 from interlock.osdp.attacks.enumerate import run_enumerate
+from interlock.osdp.attacks.fuzz import LIBOSDP_REJECTION_MARKERS
 from interlock.osdp.attacks.sniff import decode_chunks, run_sniff
-from interlock.osdp.lab_session import LabSession
+from interlock.osdp.lab_session import LabError, LabSession
 from interlock.osdp.tap_capture import CP2PD_PATH, PD2CP_PATH
 from interlock.osdp.transport import Direction
-from interlock.plugin import Finding
+from interlock.plugin import Finding, finding_from_dict
 
 _console = Console()
 
@@ -52,6 +55,13 @@ PD_ONLINE = "interlock-lab: PD 101 online"
 EVENT_RECEIVED = "interlock-lab: event received"
 _PD_ONLINE_TIMEOUT = 180.0
 _EVENT_TIMEOUT = 90.0
+
+# pd log sentinel printed once the lab PD is about to accept() (the fuzz override idles the CP).
+PD_LISTENING = "interlock-lab: PD listening on 0.0.0.0:10000"
+_PD_LISTENING_TIMEOUT = 120.0
+
+# Upper bound on container output carried into an error detail.
+_OUTPUT_TAIL = 2000
 
 REPORT_TITLE = "interlock OSDP assessment"
 
@@ -109,10 +119,17 @@ class StepResult:
     duration_s: float
 
 
-def _require_log(lab: lab_session.LabHandle, needle: str, timeout: float, what: str) -> None:
-    """Raise ``Inconclusive`` unless the cp log shows ``needle`` within ``timeout`` seconds."""
-    if not lab.wait_for_log("cp", needle, timeout=timeout):
-        raise Inconclusive(f"{what} not observed in the cp log within {timeout:.0f} s")
+def _require_log(
+    lab: lab_session.LabHandle, needle: str, timeout: float, what: str, *, service: str = "cp"
+) -> None:
+    """Raise ``Inconclusive`` unless ``service``'s log shows ``needle`` within ``timeout`` s."""
+    if not lab.wait_for_log(service, needle, timeout=timeout):
+        raise Inconclusive(f"{what} not observed in the {service} log within {timeout:.0f} s")
+
+
+def _output_tail(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the bounded tail of a command's stdout and stderr, for an error detail."""
+    return ((result.stdout or "") + (result.stderr or "")).strip()[-_OUTPUT_TAIL:]
 
 
 # sniff-enumerate: the cleartext lab with interlock's read-only TCP tap in the attacker position.
@@ -141,6 +158,93 @@ def _sniff_enumerate(session: LabSession, context: dict[str, object]) -> StepOut
     )
 
 
+# fuzz: the cleartext lab under docker-compose.fuzz.yml (the CP idles so the PD's single
+# accept() is free; the attacker idles with ./src mounted read-only at /app/src).
+_FUZZ_PROFILE = "cleartext"
+_FUZZ_OVERRIDES = ("docker-compose.fuzz.yml",)
+
+# The line protocol between the in-container sweep and the host parser. Only lines that start
+# with one of these exact prefixes are read; any other container output is ignored.
+_FINDING_PREFIX = "INTERLOCK-FINDING "
+_INCONCLUSIVE_PREFIX = "INTERLOCK-INCONCLUSIVE "
+_DONE_PREFIX = "INTERLOCK-FUZZ-DONE "
+
+# Runs inside the attacker container, whose image has no rich, typer or cryptography: the
+# standard library, interlock.plugin and interlock.osdp.attacks.fuzz only.
+_FUZZ_SCRIPT = (
+    "import json\n"
+    "from interlock.osdp.attacks.fuzz import FuzzBaselineError, fuzz_lab\n"
+    "from interlock.plugin import finding_to_dict\n"
+    "try:\n"
+    "    findings = fuzz_lab(('pd', 10000))\n"
+    "except FuzzBaselineError as exc:\n"
+    "    print('INTERLOCK-INCONCLUSIVE ' + ' '.join(str(exc).split()))\n"
+    "    raise SystemExit(0)\n"
+    "for finding in findings:\n"
+    "    print('INTERLOCK-FINDING ' + json.dumps(finding_to_dict(finding)))\n"
+    "print('INTERLOCK-FUZZ-DONE ' + str(len(findings)))\n"
+)
+
+
+def _parse_fuzz_output(stdout: str) -> list[Finding]:
+    """Parse the sweep's prefixed lines into findings; never trust unprefixed output.
+
+    An ``INTERLOCK-INCONCLUSIVE`` line raises ``Inconclusive`` (the PD never answered the
+    baseline poll). Each ``INTERLOCK-FINDING`` line must be a JSON finding document that
+    ``finding_from_dict`` accepts (``ValueError`` otherwise). The ``INTERLOCK-FUZZ-DONE`` line
+    must appear exactly once and its count must equal the parsed findings (``ValueError``
+    otherwise); a sweep that never reported completion is inconclusive.
+    """
+    findings: list[Finding] = []
+    done: int | None = None
+    for line in stdout.splitlines():
+        if line.startswith(_INCONCLUSIVE_PREFIX):
+            raise Inconclusive(line[len(_INCONCLUSIVE_PREFIX) :].strip())
+        if line.startswith(_FINDING_PREFIX):
+            findings.append(finding_from_dict(json.loads(line[len(_FINDING_PREFIX) :])))
+        elif line.startswith(_DONE_PREFIX):
+            if done is not None:
+                raise ValueError("the fuzz sweep reported completion more than once")
+            done = int(line[len(_DONE_PREFIX) :])
+    if done is None:
+        raise Inconclusive("fuzz sweep did not report completion")
+    if done != len(findings):
+        raise ValueError(
+            f"the fuzz sweep reported {done} findings but {len(findings)} finding lines parsed"
+        )
+    return findings
+
+
+def _fuzz(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Run the deterministic fuzz sweep inside the idle attacker and parse its findings."""
+    with session.scenario(_FUZZ_PROFILE, _FUZZ_OVERRIDES) as lab:
+        _require_log(lab, PD_LISTENING, _PD_LISTENING_TIMEOUT, "PD listening", service="pd")
+        result = lab.compose(
+            "exec", "-T", "-e", "PYTHONPATH=/app/src", "attacker", "python", "-c", _FUZZ_SCRIPT
+        )
+        if result.returncode != 0:
+            raise LabError(
+                f"the fuzz sweep in the attacker failed (exit {result.returncode}): "
+                f"{_output_tail(result)}"
+            )
+        findings = _parse_fuzz_output(result.stdout)
+        if findings:
+            return StepOutput(
+                findings=tuple(findings),
+                detail="the PD stopped answering valid polls during the corruption sweep",
+            )
+        pd_log = lab.logs("pd").lower()
+    if not any(marker in pd_log for marker in LIBOSDP_REJECTION_MARKERS):
+        raise Inconclusive("the corruptions never reached the PD parser")
+    return StepOutput(
+        findings=(),
+        detail=(
+            "baseline poll answered; all nine corruptions handled; the PD answered every "
+            "follow-up poll"
+        ),
+    )
+
+
 STEPS: tuple[Step, ...] = (
     Step(
         key="sniff-enumerate",
@@ -156,6 +260,20 @@ STEPS: tuple[Step, ...] = (
         ),
         clean_detail="The live captures decoded to no PD topology, identity or capabilities.",
         attacks=(("sniff", "ATK-01-"), ("enumerate", "ATK-02-")),
+    ),
+    Step(
+        key="fuzz",
+        title="Command fuzzing of the PD parser",
+        profile=_FUZZ_PROFILE,
+        overrides=_FUZZ_OVERRIDES,
+        run=_fuzz,
+        method=(
+            "active: the nine deterministic corruptions sent from the idle attacker over one "
+            "persistent connection to the PD (cp idle, docker-compose.fuzz.yml); liveness "
+            "proven by a follow-up valid poll after each"
+        ),
+        clean_detail="The PD answered every follow-up poll after each corruption.",
+        attacks=(("fuzz", "ATK-07-fuzz-"),),
     ),
 )
 
