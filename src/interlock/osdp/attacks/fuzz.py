@@ -28,7 +28,9 @@ single source of that order; ``fuzz_sweep`` and ``run_fuzz`` are both built on i
   with a valid sequence-0 CMD_POLL before the first mutation (``FuzzBaselineError``
   otherwise, so no verdict is ever drawn from an unreachable PD), and after each corrupted
   frame drains the PD's reply to it, sends a valid CMD_POLL with the next sequence
-  (1 -> 2 -> 3 -> 1) and, if that is not answered live, one sequence-0 restart poll.
+  (1 -> 2 -> 3 -> 1) and, if that is not answered live, one sequence-0 restart poll. The
+  sweep stops at the first dead PD (``run_fuzz(stop_on_failure=True)``): with one connection
+  ever, later mutations could not be attributed, so a real failure is exactly one Finding.
 - ``register`` adds the ``fuzz`` subcommand (``--seed`` / ``--variants``; lab default;
   ``--physical`` behind the SAFE-02 consent gate).
 
@@ -164,6 +166,7 @@ def run_fuzz(
     seed: int = 0,
     variants: int = 0,
     technique: str = _TECHNIQUE,
+    stop_on_failure: bool = False,
 ) -> list[Finding]:
     """Drive the sweep through a liveness ``probe`` and emit a Finding per PD failure.
 
@@ -172,11 +175,21 @@ def run_fuzz(
     responding - returns ``[]`` (the true negative of a robust parser). A frame that knocks
     the PD out (crash / hang / desync) yields one ``Finding`` naming the mutation and the seed,
     so the report can reproduce it exactly.
+
+    ``stop_on_failure`` ends the sweep at the first failure. Use it when the PD cannot be
+    re-reached after it dies (the lab PD accepts one connection): every later mutation would
+    otherwise be blamed on a PD that is already gone, so only the first is attributable.
     """
     findings: list[Finding] = []
     for label, frame_bytes in iter_mutations(good_frame, seed=seed, variants=variants):
         if probe(frame_bytes):
             continue  # PD still live: this corruption is a true negative
+        stopped = (
+            " The sweep stopped here: the PD could not be re-reached, so the remaining "
+            "mutations were not run and could not have been attributed to this PD."
+            if stop_on_failure
+            else ""
+        )
         findings.append(
             Finding(
                 id=f"ATK-07-fuzz-{label}",
@@ -186,7 +199,7 @@ def run_fuzz(
                     f"After injecting the '{label}' corruption (seed={seed}) the PD no longer "
                     f"responded to a follow-up valid CMD_POLL (crash / hang / desync). The "
                     f"frame was built by mutate.mutate over a codec.encode good frame, so it is "
-                    f"reproducible from the mutation name and seed."
+                    f"reproducible from the mutation name and seed.{stopped}"
                 ),
                 attack_technique=technique,
                 remediation=(
@@ -196,6 +209,8 @@ def run_fuzz(
                 ),
             )
         )
+        if stop_on_failure:
+            break
     return findings
 
 
@@ -328,8 +343,10 @@ def fuzz_lab(
     Opens one connection to ``upstream`` (retrying while the PD comes up), proves a live
     baseline with a valid sequence-0 poll, then runs the deterministic sweep (then seeded
     variants) through the persistent probe on that same connection. A robust PD yields ``[]``
-    (clean run / true negative). Raises ``FuzzBaselineError`` when the PD cannot be reached or
-    does not answer the baseline: a sweep against an absent PD would only report silence.
+    (clean run / true negative). The sweep stops at the first dead PD, which yields exactly
+    one Finding: the lab PD accepts one connection, so later mutations are unattributable.
+    Raises ``FuzzBaselineError`` when the PD cannot be reached or does not answer the
+    baseline: a sweep against an absent PD would only report silence.
     """
     attempts = _CONNECT_ATTEMPTS if connect_attempts is None else connect_attempts
     delay = _CONNECT_DELAY if connect_delay is None else connect_delay
@@ -337,7 +354,9 @@ def fuzz_lab(
     try:
         probe = _PersistentProbe(sock, address)
         probe.baseline()
-        return run_fuzz(craft_poll(address), probe, seed=seed, variants=variants)
+        return run_fuzz(
+            craft_poll(address), probe, seed=seed, variants=variants, stop_on_failure=True
+        )
     finally:
         sock.close()
 
@@ -412,9 +431,19 @@ def register(app: typer.Typer) -> None:
             finally:
                 endpoint.close()
         else:
-            findings = fuzz_lab(
-                (upstream_host, upstream_port), address=address, seed=seed, variants=variants
-            )
+            try:
+                findings = fuzz_lab(
+                    (upstream_host, upstream_port), address=address, seed=seed, variants=variants
+                )
+            except FuzzBaselineError as exc:
+                # No proven live baseline means no verdict: never write a "clean" report.
+                typer.echo(f"Fuzz baseline failed: {exc}", err=True)
+                typer.echo(
+                    "The PD must be reachable and idle (no other CP holding its single "
+                    "connection); for the lab, bring it up with docker-compose.fuzz.yml.",
+                    err=True,
+                )
+                raise typer.Exit(code=1) from exc
 
         if not findings:
             typer.echo(
