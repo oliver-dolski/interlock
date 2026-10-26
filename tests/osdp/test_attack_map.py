@@ -11,11 +11,15 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+from types import ModuleType
+
+import pytest
 
 from interlock import report
-from interlock.osdp import attack_map, constants
+from interlock.osdp import attack_map, codec, constants, framer
 from interlock.osdp.attack_map import ACCESS_VECTOR, ATTACK_VERSION, MAPPINGS, technique_names
-from interlock.osdp.attacks import downgrade
+from interlock.osdp.attacks import downgrade, keyset, sniff, weak_key
+from interlock.osdp.attacks import enumerate as enumerate_attack
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction
 from interlock.plugin import Finding, Severity
@@ -43,6 +47,17 @@ _STDLIB_MODULES = {"__future__", "dataclasses", "typing", "collections.abc"}
 
 # Lab PD address under every profile (lab/osdp/pd_driver.py).
 _PD_ADDRESS = 101
+
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+# Which module constants consume which MAPPINGS key: (module, Enterprise constant, ICS constant).
+_MODULE_CONSTANTS: dict[str, list[tuple[ModuleType, str, str]]] = {
+    "sniff": [(sniff, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "enumerate": [(enumerate_attack, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "weak-key": [(weak_key, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "keyset": [(keyset, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "downgrade": [(downgrade, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+}
 
 
 def _all_ids() -> list[str]:
@@ -189,3 +204,71 @@ def test_downgrade_finding_renders_technique_names_in_markdown(tmp_path) -> None
     text = report_path.read_text(encoding="utf-8")
     assert "T1689 (Downgrade Attack)" in text
     assert "T0830 (Adversary-in-the-Middle)" in text
+
+
+# --------------------------------------------------------------------------------------
+# Module constants read from the map.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", sorted(_MODULE_CONSTANTS))
+def test_module_constants_equal_the_map(key: str) -> None:
+    for module, enterprise_name, ics_name in _MODULE_CONSTANTS[key]:
+        assert getattr(module, enterprise_name, None) == MAPPINGS[key].enterprise, (
+            f"{module.__name__}.{enterprise_name}"
+        )
+        assert getattr(module, ics_name, None) == MAPPINGS[key].ics, (
+            f"{module.__name__}.{ics_name}"
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Passive attacks over the committed fixtures: Findings carry the mapped ids.
+# --------------------------------------------------------------------------------------
+
+
+def _load_session(profile: str) -> _Frames:
+    """Frame and decode both per-direction vectors of ``profile`` into tagged pairs."""
+    session: _Frames = []
+    for direction, suffix in (
+        (Direction.cp_to_pd, "cp2pd"),
+        (Direction.pd_to_cp, "pd2cp"),
+    ):
+        raw = (FIXTURES_DIR / f"{profile}_{suffix}.cap").read_bytes()
+        assert raw, f"{profile}_{suffix}.cap is empty; regenerate it from the lab"
+        session.extend((direction, codec.decode(frame)) for frame in framer.iter_frames(raw))
+    return session
+
+
+def test_sniff_findings_carry_the_mapped_ids() -> None:
+    findings = sniff.run_sniff(_load_session("cleartext"))
+    assert findings
+    for finding in findings:
+        assert finding.attack_technique == "T1040"
+        assert finding.attack_technique_ics == "T0842"
+        _assert_complete(finding, "sniff")
+
+
+def test_enumerate_finding_carries_the_mapped_ids() -> None:
+    findings = enumerate_attack.run_enumerate(_load_session("cleartext"))
+    matches = [f for f in findings if f.id == f"ATK-02-enumerate-pd-{_PD_ADDRESS}"]
+    assert len(matches) == 1, findings
+    assert matches[0].attack_technique == "T1018"
+    assert matches[0].attack_technique_ics == "T0888"
+    _assert_complete(matches[0], "enumerate")
+
+
+def test_weak_key_finding_carries_the_mapped_ids() -> None:
+    findings = weak_key.run_weak_key(_load_session("sc-scbkd"))
+    assert [f.id for f in findings] == ["ATK-06-weak-key"]
+    assert findings[0].attack_technique == "T1110.002"
+    assert findings[0].attack_technique_ics == "T1694.001"
+    _assert_complete(findings[0], "weak-key")
+
+
+def test_keyset_finding_carries_the_mapped_ids() -> None:
+    findings = keyset.run_keyset(_load_session("keyset"))
+    assert [f.id for f in findings] == ["ATK-04-keyset"]
+    assert findings[0].attack_technique == "T1040"
+    assert findings[0].attack_technique_ics == "T0842"
+    _assert_complete(findings[0], "keyset")
