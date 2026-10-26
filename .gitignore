@@ -18,6 +18,8 @@ htmlcov/
 
 # Generated reports
 interlock-report.md
+interlock-assessment.md
+interlock-assessment.json
 
 # OS
 .DS_Store
