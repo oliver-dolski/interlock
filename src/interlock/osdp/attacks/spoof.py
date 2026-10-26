@@ -23,7 +23,8 @@ baseline (``lock_state_probe()`` is False) before calling ``inject()``, then emi
 already-unlocked baseline (flagged-assumption guard, prohibition).
 
 Import discipline: importable with the standard library plus the stdlib-only Phase 3 modules
-(codec/framer/constants/transport). ``typer``, ``report`` and ``safety`` are imported lazily.
+(codec/framer/constants/transport) and the stdlib-only ``attack_map``. ``typer``, ``report`` and
+``safety`` are imported lazily.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap, Transform
 from interlock.plugin import Finding, Severity
@@ -52,8 +54,9 @@ _CONTROL_CODE_PERMANENT_ON = 0x02
 _CARD_READER_NO = 1
 _CARD_FORMAT_WIEGAND = 1
 
-# ATK-08 free-text ATT&CK id: Transmitted Data Manipulation / AiTM (T1557). Phase 5 enriches it.
-_TECHNIQUE = "T1557"
+# ATK-08 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["spoof"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["spoof"].ics
 
 # Lab defaults: listen in the attacker (inline MITM) position and rewrite toward the PD.
 _DEFAULT_LISTEN_PORT = 10000
@@ -205,6 +208,7 @@ def run_spoof(
                 "own sequence number so it was accepted as a legitimate command."
             ),
             attack_technique=technique,
+            attack_technique_ics=_ICS_TECHNIQUE,
             remediation=(
                 "Enable OSDP Secure Channel with MAC+encryption (SCS_17/18) so an in-path "
                 "attacker cannot forge or inject accepted commands; without channel integrity, "

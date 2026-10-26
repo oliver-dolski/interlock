@@ -24,8 +24,8 @@ card-presentation exchange - modelling "replaying a captured card-presentation e
 reproduces the door-open outcome" without inventing a second crafting primitive.
 
 Import discipline: importable with the standard library plus the stdlib-only Phase 3
-modules (codec/framer/constants/transport). ``typer``, ``report`` and ``safety`` are
-imported lazily inside the functions that need them.
+modules (codec/framer/constants/transport) and the stdlib-only ``attack_map``. ``typer``,
+``report`` and ``safety`` are imported lazily inside the functions that need them.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap, Transform
 from interlock.plugin import Finding, Severity
@@ -44,9 +45,9 @@ from interlock.plugin import Finding, Severity
 if TYPE_CHECKING:
     import typer
 
-# ATK-05a free-text ATT&CK id: Transmitted Data Manipulation / AiTM-style replay (T1557).
-# Phase 5 enriches it.
-_TECHNIQUE = "T1557"
+# ATK-05a ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["replay"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["replay"].ics
 
 # Lab defaults: listen in the attacker (inline MITM) position and rewrite toward the PD.
 _DEFAULT_LISTEN_PORT = 10000
@@ -66,8 +67,11 @@ LockStateProbe = Callable[[], bool]
 
 # --- ATK-05b: CVE-2024-52288 Secure Channel replay --------------------------------------
 
-# ATK-05b shares ATK-05a's AiTM/replay ATT&CK family (T1557 = _TECHNIQUE): the out-of-sequence
-# REPLY_RMAC_I is the CVE's secure-channel desync primitive, not a different technique.
+# ATK-05b ATT&CK ids, read from interlock.osdp.attack_map: the same Enterprise technique as
+# ATK-05a (the out-of-sequence REPLY_RMAC_I is an in-path desync primitive), but a different ICS
+# secondary id, because the replay defeats the channel rather than forging a reporting message.
+_CVE_TECHNIQUE = MAPPINGS["cve-2024-52288"].enterprise
+_CVE_ICS_TECHNIQUE = MAPPINGS["cve-2024-52288"].ics
 
 # Trigger file the live cve relay watches: injection arms only once this path exists, so the
 # matched-pair test observes a genuinely locked baseline before attributing any transition to the
@@ -81,7 +85,7 @@ def run_cve_replay(
     inject: Inject,
     lock_state_probe: LockStateProbe,
     *,
-    technique: str = _TECHNIQUE,
+    technique: str = _CVE_TECHNIQUE,
 ) -> list[Finding]:
     """Replay recorded secure pd->cp frames to defeat the Secure Channel (CVE-2024-52288).
 
@@ -126,6 +130,7 @@ def run_cve_replay(
                 "where a fixed core (v3.0.8) rejects the out-of-state RMAC_I and authorises nothing."
             ),
             attack_technique=technique,
+            attack_technique_ics=_CVE_ICS_TECHNIQUE,
             remediation=(
                 "Upgrade LibOSDP to 3.0.0 or later, which only accepts REPLY_RMAC_I during the "
                 "Secure Channel handshake and rejects it mid-session; CVE-2024-52288 lets an "
@@ -316,6 +321,7 @@ def run_replay(
                 "through the in-path seam - no new credential and no re-crafting."
             ),
             attack_technique=technique,
+            attack_technique_ics=_ICS_TECHNIQUE,
             remediation=(
                 "Enable OSDP Secure Channel with MAC+encryption (SCS_17/18) and reject "
                 "replayed sequence numbers; a clear-text bus with no freshness guarantee "

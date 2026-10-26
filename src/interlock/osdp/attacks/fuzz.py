@@ -35,7 +35,8 @@ single source of that order; ``fuzz_sweep`` and ``run_fuzz`` are both built on i
   ``--physical`` behind the SAFE-02 consent gate).
 
 Import discipline: importable with the standard library plus the stdlib-only Phase 3 modules
-(codec/constants/framer/mutate). ``typer``, ``report`` and ``safety`` are imported lazily.
+(codec/constants/framer/mutate) and the stdlib-only ``attack_map``. ``typer``, ``report`` and
+``safety`` are imported lazily.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.mutate import Mutation, mutate
 from interlock.plugin import Finding, Severity
@@ -70,8 +72,9 @@ _CONNECT_DELAY = 1.0
 _REPLY_TIMEOUT = 2.0
 _DRAIN_SECONDS = 0.3
 
-# ATK-07 free-text ATT&CK id: Endpoint Denial of Service (T1499). Phase 5 enriches it.
-_TECHNIQUE = "T1499"
+# ATK-07 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["fuzz"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["fuzz"].ics
 
 # Lowercase substrings of LibOSDP PD log lines showing that a corrupted frame reached the PD's
 # parser and was rejected there. A lab oracle (matched case-insensitively against the PD log):
@@ -202,6 +205,7 @@ def run_fuzz(
                     f"reproducible from the mutation name and seed.{stopped}"
                 ),
                 attack_technique=technique,
+                attack_technique_ics=_ICS_TECHNIQUE,
                 remediation=(
                     "Harden the PD's OSDP parser to fail closed on malformed / out-of-sequence "
                     "frames (bounded length, strict sequence and trailer validation) and keep "
