@@ -25,7 +25,7 @@ from typer.testing import CliRunner
 
 from interlock import report
 from interlock.cli import app
-from interlock.osdp import lab_session
+from interlock.osdp import codec, constants, framer, lab_session, secure_channel
 from interlock.osdp.assessment import (
     _FUZZ_SCRIPT,
     STEPS,
@@ -40,6 +40,7 @@ from interlock.osdp.assessment import (
     write_reports,
 )
 from interlock.osdp.lab_session import LabSession
+from interlock.osdp.transport import Direction
 from interlock.plugin import Finding, Severity, finding_to_dict
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "osdp" / "fixtures"
@@ -58,10 +59,27 @@ _LOGS = {"cp": _CP_LOG, "pd": _PD_LOG}
 # The in-container fuzz sweep on a healthy PD: no finding, completion reported.
 _FUZZ_CLEAN = "INTERLOCK-FUZZ-DONE 0\n"
 
-# The live tap capture per in-container basename, from the committed cleartext fixtures.
-_CAPTURES = {
-    "cp2pd.cap": (FIXTURES_DIR / "cleartext_cp2pd.cap").read_bytes(),
-    "pd2cp.cap": (FIXTURES_DIR / "cleartext_pd2cp.cap").read_bytes(),
+
+
+def _fixture_pair(name: str) -> dict[str, bytes]:
+    """Return a committed capture pair keyed by its in-container basename."""
+    return {
+        "cp2pd.cap": (FIXTURES_DIR / f"{name}_cp2pd.cap").read_bytes(),
+        "pd2cp.cap": (FIXTURES_DIR / f"{name}_pd2cp.cap").read_bytes(),
+    }
+
+
+_TAP = "docker-compose.tap.yml"
+_DOWNGRADE = "docker-compose.downgrade.yml"
+_SNIFF_BRING_UP = ("cleartext", _TAP)
+
+# The live capture pair per bring-up, keyed by (LAB_SCENARIO, last override): a healthy lab.
+# The downgrade relay forces the attacked session to clear-text, so it reads like cleartext.
+_BRING_UP_CAPTURES = {
+    _SNIFF_BRING_UP: _fixture_pair("cleartext"),
+    ("sc-scbkd", _TAP): _fixture_pair("sc-scbkd"),
+    ("downgrade", _TAP): _fixture_pair("downgrade"),
+    ("downgrade", _DOWNGRADE): _fixture_pair("cleartext"),
 }
 
 # Flags of the base ``docker compose`` argv that take a value before the subcommand.
@@ -83,9 +101,10 @@ class FakeCompose:
     """A recording ``Runner`` that simulates the lab per compose subcommand.
 
     ``returncodes`` overrides the exit code per subcommand; ``logs`` overrides the log text
-    per service; ``captures`` overrides the bytes returned for a capture basename (b""
-    simulates an empty capture); ``fuzz_stdout`` and ``fuzz_returncode`` script the
-    in-container fuzz sweep.
+    per service; ``bring_up_captures`` replaces the capture pair of a bring-up, keyed by
+    (LAB_SCENARIO, last override); ``captures`` overrides single basenames of the
+    sniff-enumerate bring-up (b"" simulates an empty capture); ``fuzz_stdout`` and
+    ``fuzz_returncode`` script the in-container fuzz sweep.
     """
 
     def __init__(
@@ -94,15 +113,24 @@ class FakeCompose:
         returncodes: Mapping[str, int] | None = None,
         logs: Mapping[str, str] | None = None,
         captures: Mapping[str, bytes] | None = None,
+        bring_up_captures: Mapping[tuple[str, str], Mapping[str, bytes]] | None = None,
         fuzz_stdout: str = _FUZZ_CLEAN,
         fuzz_returncode: int = 0,
     ) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.returncodes = dict(returncodes or {})
         self.logs = {**_LOGS, **(logs or {})}
-        self.captures = {**_CAPTURES, **(captures or {})}
+        self.bring_up_captures = {
+            key: dict(pair) for key, pair in {**_BRING_UP_CAPTURES, **(bring_up_captures or {})}.items()
+        }
+        self.captures.update(captures or {})
         self.fuzz_stdout = fuzz_stdout
         self.fuzz_returncode = fuzz_returncode
+
+    @property
+    def captures(self) -> dict[str, bytes]:
+        """The capture pair of the sniff-enumerate bring-up (cleartext under the tap)."""
+        return self.bring_up_captures[_SNIFF_BRING_UP]
 
     @property
     def argvs(self) -> list[list[str]]:
@@ -120,7 +148,8 @@ class FakeCompose:
         elif sub == "exec" and _FUZZ_SCRIPT in argv:
             stdout, returncode = self.fuzz_stdout, self.fuzz_returncode
         elif sub == "exec":
-            stdout = base64.b64encode(self.captures[PurePosixPath(argv[-1]).name]).decode()
+            pair = self.bring_up_captures[(env["LAB_SCENARIO"], _overrides(argv)[-1])]
+            stdout = base64.b64encode(pair[PurePosixPath(argv[-1]).name]).decode()
         else:
             stdout = ""
         return subprocess.CompletedProcess(argv, returncode, stdout, "")
@@ -171,10 +200,15 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeCompose:
 _HEALTHY_LAB_STATUSES = {
     "sniff-enumerate": "vulnerable",
     "fuzz": "not_vulnerable",
+    "weak-key-keyset": "vulnerable",
+    "downgrade": "vulnerable",
 }
 _HEALTHY_LAB_BRING_UPS = [
-    ("cleartext", ("docker-compose.tap.yml",)),
+    ("cleartext", (_TAP,)),
     ("cleartext", ("docker-compose.fuzz.yml",)),
+    ("sc-scbkd", (_TAP,)),
+    ("downgrade", (_TAP,)),
+    ("downgrade", (_DOWNGRADE,)),
 ]
 
 
@@ -457,6 +491,8 @@ class FakeClock:
 def _steps(*keys: str) -> tuple[Step, ...]:
     """Return the real ``STEPS`` entries named by ``keys``, in the order given."""
     by_key = {step.key: step for step in STEPS}
+    missing = [key for key in keys if key not in by_key]
+    assert not missing, f"STEPS has no step {missing}"
     return tuple(by_key[key] for key in keys)
 
 
@@ -656,3 +692,160 @@ def test_fuzz_script_imports_only_stdlib_plugin_and_fuzz() -> None:
     assert imported, "the scan found no imports at all"
     for name in imported:
         assert name in allowed or name.split(".")[0] in sys.stdlib_module_names, name
+
+
+# ---------------------------------------------------------------------------------------------
+# The Secure Channel steps: weak-key + keyset on sc-scbkd, the downgrade before/after pair.
+
+
+def _finding_ids(result: StepResult) -> set[str]:
+    return {finding.id for finding in result.findings}
+
+
+def test_steps_continue_with_the_secure_channel_steps() -> None:
+    keys = [step.key for step in STEPS]
+    assert keys[:4] == ["sniff-enumerate", "fuzz", "weak-key-keyset", "downgrade"]
+    weak, down = _steps("weak-key-keyset", "downgrade")
+    assert (weak.profile, weak.overrides) == ("sc-scbkd", (_TAP,))
+    assert weak.attacks == (("weak-key", "ATK-06-"), ("keyset", "ATK-04-"))
+    assert (down.profile, down.overrides) == ("downgrade", (_TAP, _DOWNGRADE))
+    assert down.attacks == (("downgrade", "ATK-03-"),)
+
+
+def test_weak_key_keyset_on_the_sc_scbkd_capture_flags_the_weak_key(lab_dir: Path) -> None:
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): _fixture_pair("sc-scbkd")})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert "ATK-06-weak-key" in _finding_ids(result)
+    assert _bring_ups(fake) == [("sc-scbkd", (_TAP,))]
+    assert fake.argvs[-1] == [*_base(lab_dir, _TAP), "down", "-v"]
+
+
+def test_weak_key_keyset_on_the_keyset_capture_recovers_the_enrolled_key(lab_dir: Path) -> None:
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): _fixture_pair("keyset")})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert "ATK-04-keyset" in _finding_ids(result)
+
+
+def test_weak_key_keyset_without_a_handshake_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): _fixture_pair("cleartext")})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.INCONCLUSIVE
+    assert "no Secure Channel handshake captured" in result.detail
+    assert result.findings == ()
+
+
+@pytest.mark.parametrize("basename", ["cp2pd.cap", "pd2cp.cap"])
+def test_weak_key_keyset_with_an_empty_capture_is_inconclusive(
+    lab_dir: Path, basename: str
+) -> None:
+    pair = {**_fixture_pair("sc-scbkd"), basename: b""}
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.INCONCLUSIVE
+    assert "empty" in result.detail
+
+
+def test_weak_key_keyset_decodes_up_to_400_frames(
+    lab_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from interlock.osdp import assessment
+
+    seen: list[int] = []
+    real = assessment.decode_chunks
+
+    def spy(chunks: object, *, max_frames: int = 200) -> object:
+        seen.append(max_frames)
+        return real(chunks, max_frames=max_frames)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(assessment, "decode_chunks", spy)
+    [result] = _run_steps(lab_dir, FakeCompose(), "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert seen == [400]
+
+
+def test_downgrade_pair_forced_to_clear_text_is_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose(
+        bring_up_captures={
+            ("downgrade", _TAP): _fixture_pair("downgrade"),
+            ("downgrade", _DOWNGRADE): _fixture_pair("cleartext"),
+        }
+    )
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.VULNERABLE
+    assert "ATK-03-downgrade" in _finding_ids(result)
+
+    # Two bring-ups of the downgrade profile, each torn down: the tap, then the relay.
+    assert _bring_ups(fake) == [("downgrade", (_TAP,)), ("downgrade", (_DOWNGRADE,))]
+    ups = [argv for argv in fake.argvs if _subcommand(argv) == "up"]
+    downs = [argv for argv in fake.argvs[1:] if _subcommand(argv) == "down"]
+    assert ups == [
+        [*_base(lab_dir, _TAP), "up", "-d", "--build", "--force-recreate"],
+        [*_base(lab_dir, _DOWNGRADE), "up", "-d", "--build", "--force-recreate"],
+    ]
+    assert downs == [[*_base(lab_dir, _TAP), "down", "-v"], [*_base(lab_dir, _DOWNGRADE), "down", "-v"]]
+
+
+def test_downgrade_with_a_clear_text_baseline_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(
+        bring_up_captures={
+            ("downgrade", _TAP): _fixture_pair("cleartext"),
+            ("downgrade", _DOWNGRADE): _fixture_pair("cleartext"),
+        }
+    )
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "baseline was not Secure Channel"
+    # No verdict without a secure baseline, so the attacked bring-up never runs.
+    assert _bring_ups(fake) == [("downgrade", (_TAP,))]
+
+
+def test_downgrade_whose_attacked_session_stays_secure_is_not_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose(
+        bring_up_captures={
+            ("downgrade", _TAP): _fixture_pair("downgrade"),
+            ("downgrade", _DOWNGRADE): _fixture_pair("downgrade"),
+        }
+    )
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.NOT_VULNERABLE
+    assert "attacked session stayed Secure Channel" in result.detail
+
+
+def _without_pdcap(capture: bytes) -> bytes:
+    """Return ``capture`` with every REPLY_PDCAP frame dropped (nothing left to strip)."""
+    return b"".join(
+        raw for raw in framer.iter_frames(capture)
+        if codec.decode(raw).code != constants.REPLY_PDCAP
+    )
+
+
+def test_downgrade_with_no_communication_security_advertised_is_inconclusive(
+    lab_dir: Path,
+) -> None:
+    baseline = _fixture_pair("downgrade")
+    baseline["pd2cp.cap"] = _without_pdcap(baseline["pd2cp.cap"])
+    fake = FakeCompose(
+        bring_up_captures={
+            ("downgrade", _TAP): baseline,
+            ("downgrade", _DOWNGRADE): _fixture_pair("downgrade"),
+        }
+    )
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "baseline advertised no CommunicationSecurity to strip"
+
+
+def test_the_pdcap_free_baseline_is_still_secure() -> None:
+    """Guard for the test above: dropping REPLY_PDCAP keeps the baseline Secure Channel."""
+    pair = _fixture_pair("downgrade")
+    frames = [
+        (direction, codec.decode(raw))
+        for direction, data in (
+            (Direction.cp_to_pd, pair["cp2pd.cap"]),
+            (Direction.pd_to_cp, _without_pdcap(pair["pd2cp.cap"])),
+        )
+        for raw in framer.iter_frames(data)
+    ]
+    assert secure_channel.detect_state(frames).secure
