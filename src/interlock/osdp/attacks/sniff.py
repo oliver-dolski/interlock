@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap
 from interlock.plugin import Finding, Severity
@@ -42,8 +43,9 @@ _DEFAULT_LISTEN_PORT = 10000
 _DEFAULT_UPSTREAM = ("pd", 10000)
 _DEFAULT_MAX_FRAMES = 200
 
-# ATK-01 free-text ATT&CK id (T1040 Network Sniffing); Phase 5 enriches the mapping.
-_TECHNIQUE = "T1040"
+# ATK-01 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["sniff"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["sniff"].ics
 
 
 def decode_chunks(
@@ -128,6 +130,7 @@ def run_sniff(
                     f"Secure Channel posture: {posture}."
                 ),
                 attack_technique=technique,
+                attack_technique_ics=_ICS_TECHNIQUE,
                 remediation=remediation,
             )
         )

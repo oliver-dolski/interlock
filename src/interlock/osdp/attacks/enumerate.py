@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap
 from interlock.plugin import Finding, Severity
@@ -56,8 +57,9 @@ _SWEEP_ADDRESSES = range(0x80)  # 0x00..0x7F inclusive
 # Per-reply read size for the active sweep injectors (TCP and serial).
 _READ_SIZE = 4096
 
-# ATK-02 free-text ATT&CK id (T1200 default per the plan); Phase 5 enriches the mapping.
-_TECHNIQUE = "T1200"
+# ATK-02 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["enumerate"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["enumerate"].ics
 
 # OSDP PD capability function codes -> readable names, matching the pyosdp Capability enum the
 # lab PD driver builds from (lab/osdp/pd_driver.py: getattr(Capability, name)). VERIFIED
@@ -188,6 +190,7 @@ def run_enumerate(
                     f"advertised capabilities: {cap_str}."
                 ),
                 attack_technique=technique,
+                attack_technique_ics=_ICS_TECHNIQUE,
                 remediation=(
                     "Enable OSDP Secure Channel so identity (REPLY_PDID) and capability "
                     "(REPLY_PDCAP) replies are authenticated and encrypted; unauthenticated "

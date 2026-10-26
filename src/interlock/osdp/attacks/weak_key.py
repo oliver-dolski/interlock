@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import constants
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap
 from interlock.plugin import Finding, Severity
@@ -48,8 +49,9 @@ _DEFAULT_LISTEN_PORT = 10000
 _DEFAULT_UPSTREAM = ("pd", 10000)
 _DEFAULT_MAX_FRAMES = 200
 
-# ATK-06 free-text ATT&CK id (T1110 Brute Force - default/weak key); Phase 5 enriches it.
-_TECHNIQUE = "T1110"
+# ATK-06 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["weak-key"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["weak-key"].ics
 
 # Secure Channel random / cryptogram field sizes, from the OSDP handshake layout (mirrors
 # secure_channel): RND.A and RND.B are 8 bytes each, the PD cryptogram is one 16-byte block.
@@ -141,6 +143,7 @@ def run_weak_key(
                             f"(PyCA), not a heuristic."
                         ),
                         attack_technique=technique,
+                        attack_technique_ics=_ICS_TECHNIQUE,
                         remediation=(
                             "Replace the default Secure Channel Base Key (SCBK-D) with a "
                             "unique per-site key; the spec default provides no "

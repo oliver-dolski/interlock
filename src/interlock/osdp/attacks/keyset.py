@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap
 from interlock.plugin import Finding, Severity
@@ -69,8 +70,9 @@ _DEFAULT_MAX_FRAMES = 200
 # Per-reply read size for the active send/receive injectors (TCP and serial).
 _READ_SIZE = 4096
 
-# ATK-04 free-text ATT&CK id (T1212 Exploitation for Credential Access); Phase 5 enriches it.
-_TECHNIQUE = "T1212"
+# ATK-04 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["keyset"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["keyset"].ics
 
 # OSDP KEYSET payload: key_type 0x01 = SCBK (set the Secure Channel Base Key). The payload is
 # key_type(1) || key_length(1) || key. VERIFIED against the committed sc-scbkd KEYSET fixture.
@@ -233,6 +235,7 @@ def _recovery_finding(key: bytes, technique: str) -> Finding:
             "derived from SCBK-D and the R-MAC read from REPLY_RMAC_I."
         ),
         attack_technique=technique,
+        attack_technique_ics=_ICS_TECHNIQUE,
         remediation=(
             "Do not leave readers in install mode on the production bus; after enrolment, "
             "provision a unique per-site SCBK and disable install mode so the default SCBK-D "
