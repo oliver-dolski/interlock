@@ -25,7 +25,15 @@ from typer.testing import CliRunner
 
 from interlock import report
 from interlock.cli import app
-from interlock.osdp import assessment, codec, constants, framer, lab_session, secure_channel
+from interlock.osdp import (
+    assessment,
+    attack_map,
+    codec,
+    constants,
+    framer,
+    lab_session,
+    secure_channel,
+)
 from interlock.osdp.assessment import (
     _FUZZ_SCRIPT,
     STEPS,
@@ -1250,3 +1258,50 @@ def test_coverage_marks_an_attack_whose_step_never_ran() -> None:
     rows = assessment.coverage([])
     assert len(rows) == 9
     assert {row.result for row in rows} == {"not run"}
+
+
+# Full-report shape (ASSESS-02) and size and content bounds (T-05-20). ------------------------
+
+
+def _assess_healthy_lab(tmp_path: Path, lab_dir: Path) -> tuple[str, str]:
+    """Run ``osdp assess`` over the healthy fake lab and return (markdown, raw JSON)."""
+    md_path = tmp_path / "out" / "assessment.md"
+    result = runner.invoke(app, ["osdp", "assess", "-o", str(md_path), "--lab-dir", str(lab_dir)])
+    assert result.exit_code == 0, result.output
+    json_path = md_path.with_suffix(".json")
+    return md_path.read_text(encoding="utf-8"), json_path.read_text(encoding="utf-8")
+
+
+def test_every_finding_of_a_full_assessment_is_complete_and_mapped(
+    tmp_path: Path, lab_dir: Path, fake: FakeCompose
+) -> None:
+    markdown, raw_json = _assess_healthy_lab(tmp_path, lab_dir)
+    findings = json.loads(raw_json)["findings"]
+    assert findings
+    severities = {severity.value for severity in Severity}
+    enterprise_ids = {technique.enterprise for technique in attack_map.MAPPINGS.values()}
+    for finding in findings:
+        fid = finding["id"]
+        assert finding["severity"] in severities, fid
+        for field in ("title", "evidence", "remediation", "attack_technique"):
+            assert isinstance(finding[field], str) and finding[field].strip(), f"{fid}: {field}"
+        assert finding["attack_technique"] in enterprise_ids, fid
+        assert fid in markdown, fid
+
+
+# The healthy fake run writes about 10 kB of Markdown and 13 kB of JSON (2026-10-27); 128 KiB
+# is ten times that, so only a report that started dumping captures, frames or logs crosses it.
+_REPORT_BYTE_BOUND = 128 * 1024
+
+
+def test_assessment_reports_stay_bounded_and_carry_no_capture_bytes(
+    tmp_path: Path, lab_dir: Path, fake: FakeCompose
+) -> None:
+    markdown, raw_json = _assess_healthy_lab(tmp_path, lab_dir)
+    for name, text in (("markdown", markdown), ("json", raw_json)):
+        assert len(text.encode("utf-8")) < _REPORT_BYTE_BOUND, name
+    for basename, capture in fake.captures.items():
+        assert len(capture) >= 32, basename
+        for marker in (capture.hex()[:64], base64.b64encode(capture).decode()[:44]):
+            assert marker not in markdown, f"{basename} dumped into markdown"
+            assert marker not in raw_json, f"{basename} dumped into json"

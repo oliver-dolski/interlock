@@ -19,10 +19,13 @@ from __future__ import annotations
 import ast
 import json
 import re
+import shutil
 import string
+import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
 from typer.testing import CliRunner
 
 from interlock import report
@@ -364,3 +367,103 @@ def test_import_scan_flags_a_planted_physical_import() -> None:
         "line 3: from interlock.osdp.safety import open_physical_endpoint",
         "line 4: from interlock.osdp.transport import open_serial_endpoint",
     ]
+
+
+# SAFE-03 key-literal guard over git-tracked non-Python text files. ---------------------------
+
+_DIGEST_LENGTHS = (40, 64)
+_HEX_RUN = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32,}(?![0-9A-Fa-f])")
+
+
+def find_text_key_literals(text: str, path: str) -> list[KeyLiteral]:
+    """Return every run of 32 or more hex chars in ``text`` not covered by the allow-list.
+
+    A run of exactly 32 hex chars is a 16-byte key and passes only if allow-listed for
+    ``path``. Runs of 40 and 64 chars are SHA-1 and SHA-256 digest lengths (a pinned commit
+    in a Dockerfile, a checksum) and are skipped; any other longer run is flagged.
+    """
+    hits: list[KeyLiteral] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        for match in _HEX_RUN.finditer(line):
+            run = match.group()
+            if len(run) in _DIGEST_LENGTHS:
+                continue
+            value = bytes.fromhex(run[: len(run) // 2 * 2])
+            if len(run) == 2 * _KEY_LENGTH and _allowed(value, path):
+                continue
+            hits.append(KeyLiteral(path, number, value))
+    return hits
+
+
+def _tracked_text_files() -> list[Path]:
+    git = shutil.which("git")
+    if git is None or not (REPO_ROOT / ".git").exists():
+        pytest.skip("git or the repository is unavailable")
+    listed = subprocess.run(
+        [git, "-C", str(REPO_ROOT), "ls-files", "-z"], capture_output=True, check=True
+    ).stdout.decode()
+    paths = [REPO_ROOT / name for name in listed.split("\0") if name and not name.endswith(".py")]
+    return [p for p in paths if p.is_file() and b"\0" not in p.read_bytes()]
+
+
+def test_tracked_text_files_have_no_unexplained_key_literal() -> None:
+    files = _tracked_text_files()
+    assert any(path.name == "README.md" for path in files), "scan found no text files"
+    violations = [
+        hit
+        for path in files
+        for hit in find_text_key_literals(
+            path.read_text(encoding="utf-8", errors="replace"),
+            path.relative_to(REPO_ROOT).as_posix(),
+        )
+    ]
+    assert not violations, "key literal in a tracked text file:\n" + "\n".join(
+        str(hit) for hit in violations
+    )
+
+
+def test_text_scanner_flags_a_planted_hex_key_and_allows_scbk_d(tmp_path: Path) -> None:
+    key = "a5" * _KEY_LENGTH
+    planted = tmp_path / "planted.yml"
+    planted.write_text(
+        f"scbk: {key}\nok: {_SCBK_D.hex()}\nshort: {'ab' * 15}\nsha: {'c0' * 20}\n"
+        f"odd: {'d1' * 24}\n",
+        encoding="utf-8",
+    )
+    hits = find_text_key_literals(planted.read_text(encoding="utf-8"), "lab/planted.yml")
+    assert hits == [
+        KeyLiteral("lab/planted.yml", 1, bytes.fromhex(key)),
+        KeyLiteral("lab/planted.yml", 5, bytes.fromhex("d1" * 24)),
+    ]
+
+
+def test_text_scanner_confines_the_lab_downgrade_key(tmp_path: Path) -> None:
+    line = f"key: {_LAB_DOWNGRADE_KEY.hex().upper()}\n"
+    assert find_text_key_literals(line, "lab/x.yml") == []
+    assert find_text_key_literals(line, "docs/x.md") == [
+        KeyLiteral("docs/x.md", 1, _LAB_DOWNGRADE_KEY)
+    ]
+
+
+# T-05-08 fuzz override containment and 05-08 ignored default outputs. ----------------------
+
+
+def test_fuzz_override_publishes_no_ports_and_mounts_src_read_only() -> None:
+    lines = [
+        line.split("#", 1)[0].rstrip()
+        for line in (REPO_ROOT / "docker-compose.fuzz.yml").read_text(encoding="utf-8").splitlines()
+    ]
+    keys = [line.strip().split(":", 1)[0] for line in lines if line.strip()]
+    assert "ports" not in keys and "expose" not in keys
+    mounts = [line.strip()[2:].strip() for line in lines if line.strip().startswith("- ")]
+    assert mounts == ["./src:/app/src:ro"]
+    assert "network_mode" not in keys and "networks" not in keys
+
+
+@pytest.mark.parametrize("name", ["interlock-assessment.md", "interlock-assessment.json"])
+def test_default_assessment_outputs_are_git_ignored(name: str) -> None:
+    git = shutil.which("git")
+    if git is None or not (REPO_ROOT / ".git").exists():
+        pytest.skip("git or the repository is unavailable")
+    result = subprocess.run([git, "-C", str(REPO_ROOT), "check-ignore", "-q", name], check=False)
+    assert result.returncode == 0, f"{name} is not git-ignored"

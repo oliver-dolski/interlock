@@ -365,3 +365,17 @@ def test_no_attack_module_holds_a_technique_constant_outside_the_map() -> None:
             if name.endswith("TECHNIQUE"):
                 found.add((module.__name__, name))
     assert found == listed
+
+
+_ICS_ID = re.compile(r"^T0\d{3}$")
+
+
+def test_enterprise_ids_are_never_ics_ids() -> None:
+    # Since v19 new ICS ids are T16xx (T0812 -> T1694.001), so an ICS id is not always T0xxx;
+    # what must hold is that no legacy T0xxx id sits on the Enterprise side and that no ICS id
+    # doubles as an Enterprise id of the map.
+    enterprise_ids = {technique.enterprise for technique in MAPPINGS.values()}
+    for key, technique in MAPPINGS.items():
+        assert not _ICS_ID.match(technique.enterprise), f"{key}: {technique.enterprise} is ICS"
+        if technique.ics is not None:
+            assert technique.ics not in enterprise_ids, f"{key}: {technique.ics} is Enterprise"
