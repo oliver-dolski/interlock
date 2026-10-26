@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import socket
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -197,19 +198,29 @@ _PD_ADDRESS = 101
 _SOCKET_TIMEOUT = 10.0
 
 
-def _ack(request: OsdpFrame) -> bytes:
-    """Build the REPLY_ACK a PD sends to ``request``: reply flag set, same sequence, CRC."""
+def _reply(sequence: int, code: int, data: bytes = b"") -> bytes:
+    """Build a PD reply frame: reply flag set, ``sequence`` echoed, CRC trailer."""
     return codec.encode(
         OsdpFrame(
-            had_mark=request.had_mark,
+            had_mark=True,
             address=_PD_ADDRESS | constants.ADDR_REPLY_FLAG,
-            control=constants.PKT_CONTROL_CRC | (request.control & constants.PKT_CONTROL_SQN),
+            control=constants.PKT_CONTROL_CRC | (sequence & constants.PKT_CONTROL_SQN),
             scb=b"",
-            code=constants.REPLY_ACK,
-            data=b"",
+            code=code,
+            data=data,
             use_crc=True,
         )
     )
+
+
+def _ack(request: OsdpFrame) -> bytes:
+    """Build the REPLY_ACK a PD sends to ``request``: reply flag set, same sequence, CRC."""
+    return _reply(request.control & constants.PKT_CONTROL_SQN, constants.REPLY_ACK)
+
+
+def _nak(sequence: int) -> bytes:
+    """Build a REPLY_NAK (error code 0x04, sequence error) echoing ``sequence``."""
+    return _reply(sequence, constants.REPLY_NAK, b"\x04")
 
 
 class _OneAcceptPd:
@@ -217,14 +228,40 @@ class _OneAcceptPd:
 
     It frames the incoming stream with ``framer.iter_frames`` and ``codec.decode`` and answers
     every decodable CMD_POLL addressed to 101 with a REPLY_ACK; everything else is ignored.
-    ``answer=False`` makes a PD that accepts the connection but never replies. Every socket op
-    carries a timeout so no test can hang.
+    It also recognises the nine corrupted frames of the default sweep, in order, each one
+    arriving right after an ACK (the probe's rhythm), and drops it from its framing buffer, as a
+    PD resyncing past a bad frame would.
+    Every socket op carries a timeout so no test can hang. Modes:
+
+    - ``answer=False``: accepts the connection but never replies.
+    - ``close_after=N``: closes the connection on receiving the Nth corrupted frame (a PD
+      that dies under mutation N).
+    - ``nak_in_sequence=True``: NAKs every poll with a non-zero sequence but ACKs a
+      sequence-0 restart poll (a PD that lost sequence sync but recovers on restart).
+    - ``nak_corruption=True``: answers each corrupted frame itself with a NAK, then ACKs the
+      follow-up poll as usual.
+
+    ``poll_sequences`` records the sequence of every poll received, in order.
     """
 
-    def __init__(self, *, answer: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        answer: bool = True,
+        close_after: int | None = None,
+        nak_in_sequence: bool = False,
+        nak_corruption: bool = False,
+    ) -> None:
         self.answer = answer
+        self.close_after = close_after
+        self.nak_in_sequence = nak_in_sequence
+        self.nak_corruption = nak_corruption
         self.accepted = 0
         self.polls_answered = 0
+        self.mutations_seen = 0
+        self.poll_sequences: list[int] = []
+        self._corpus = [frame for _label, frame in iter_mutations(craft_poll(_PD_ADDRESS))]
+        self._expect_corruption = False
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
@@ -252,7 +289,31 @@ class _OneAcceptPd:
                 if not chunk:
                     return
                 buffer += chunk
+                buffer, alive = self._strip_corruptions(conn, buffer)
+                if not alive:
+                    return  # closing the connection: the PD "died" under this mutation
                 buffer = self._handle(conn, buffer)
+
+    def _strip_corruptions(self, conn: socket.socket, buffer: bytes) -> tuple[bytes, bool]:
+        """Remove the next corrupted frame from the head of ``buffer``, applying the mode.
+
+        A corruption is only expected right after the PD ACKed a poll (the probe sends one
+        corrupted frame, then polls until it gets a live reply). Matching on bytes alone is
+        not enough: ``illegal_seq`` is byte-identical to the sequence-0 restart poll.
+        Returns the remaining buffer and False when the PD should close the connection now.
+        """
+        if not self._expect_corruption or self.mutations_seen >= len(self._corpus):
+            return buffer, True
+        corrupted = self._corpus[self.mutations_seen]
+        if not buffer.startswith(corrupted):
+            return buffer, True
+        self._expect_corruption = False
+        self.mutations_seen += 1
+        if self.close_after is not None and self.mutations_seen >= self.close_after:
+            return b"", False
+        if self.nak_corruption:
+            conn.sendall(_nak(self.poll_sequences[-1]))
+        return buffer[len(corrupted) :], True
 
     def _handle(self, conn: socket.socket, buffer: bytes) -> bytes:
         """Answer every complete poll in ``buffer``; return the bytes after the last frame."""
@@ -265,10 +326,22 @@ class _OneAcceptPd:
                 continue
             if frame.code != constants.CMD_POLL or frame.address != _PD_ADDRESS:
                 continue
-            if self.answer:
-                conn.sendall(_ack(frame))
-                self.polls_answered += 1
+            sequence = frame.control & constants.PKT_CONTROL_SQN
+            self.poll_sequences.append(sequence)
+            if not self.answer:
+                continue
+            if self.nak_in_sequence and sequence != 0:
+                conn.sendall(_nak(sequence))
+                continue
+            conn.sendall(_ack(frame))
+            self.polls_answered += 1
+            self._expect_corruption = True
         return buffer[consumed:]
+
+    @property
+    def restarts(self) -> int:
+        """Sequence-0 polls received after the baseline (the probe's restart retries)."""
+        return self.poll_sequences[1:].count(0)
 
     def join(self) -> None:
         self._thread.join(timeout=_SOCKET_TIMEOUT)
@@ -310,3 +383,114 @@ def test_fuzz_lab_raises_when_nothing_is_listening() -> None:
     port = _free_port()
     with pytest.raises(FuzzBaselineError, match=f"127.0.0.1:{port}"):
         fuzz_lab(("127.0.0.1", port), connect_attempts=2, connect_delay=0.01)
+
+
+# --------------------------------------------------------------------------------------
+# Attributable failures: stop on the first dead PD.
+# --------------------------------------------------------------------------------------
+
+
+class _DiesOnCall:
+    """A liveness probe that reports the PD dead on call ``n`` (1-based) only."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.calls = 0
+
+    def __call__(self, _frame: bytes) -> bool:
+        self.calls += 1
+        return self.calls != self.n
+
+
+def test_run_fuzz_stop_on_failure_reports_only_the_first_dead_mutation() -> None:
+    """stop_on_failure=True: one Finding for the 3rd mutation, and the probe is not called again."""
+    probe = _DiesOnCall(3)
+    findings = run_fuzz(_good(), probe, stop_on_failure=True)
+    third = list(Mutation)[2].value
+    assert probe.calls == 3
+    assert len(findings) == 1, findings
+    assert findings[0].id == f"ATK-07-fuzz-{third}"
+    evidence = findings[0].evidence.lower()
+    assert "stopped" in evidence
+    assert "attribut" in evidence
+    assert "seed=0" in evidence
+
+
+def test_run_fuzz_default_keeps_probing_every_mutation() -> None:
+    """stop_on_failure left at its default: every mutation is probed, one Finding per failure."""
+    probe = _DiesOnCall(3)
+    findings = run_fuzz(_good(), probe)
+    assert probe.calls == _NINE
+    assert [f.id for f in findings] == [f"ATK-07-fuzz-{list(Mutation)[2].value}"]
+    assert "stopped" not in findings[0].evidence.lower()
+
+
+def test_fuzz_lab_attributes_a_dead_pd_to_exactly_one_mutation() -> None:
+    """A PD that closes the connection on the 4th corruption yields one Finding naming it."""
+    pd = _OneAcceptPd(close_after=4)
+    findings = fuzz_lab(("127.0.0.1", pd.port), connect_attempts=1)
+    pd.join()
+    fourth = list(Mutation)[3].value
+    assert [f.id for f in findings] == [f"ATK-07-fuzz-{fourth}"]
+    assert pd.accepted == 1
+
+
+# --------------------------------------------------------------------------------------
+# Recoverable sequence errors are not crashes.
+# --------------------------------------------------------------------------------------
+
+
+def test_fuzz_lab_counts_a_pd_that_naks_in_sequence_but_acks_the_restart_as_live() -> None:
+    """NAK to the in-sequence follow-up poll, ACK to the sequence-0 restart: the PD is live."""
+    pd = _OneAcceptPd(nak_in_sequence=True)
+    findings = fuzz_lab(("127.0.0.1", pd.port), connect_attempts=1)
+    pd.join()
+    assert findings == []
+    assert pd.restarts == _NINE  # every mutation needed the restart retry
+
+
+def test_fuzz_lab_drains_the_nak_to_the_corrupted_frame() -> None:
+    """A NAK answering the corruption itself is drained, not read as the follow-up poll's reply."""
+    pd = _OneAcceptPd(nak_corruption=True)
+    findings = fuzz_lab(("127.0.0.1", pd.port), connect_attempts=1)
+    pd.join()
+    assert findings == []
+    assert pd.mutations_seen == _NINE
+    assert pd.restarts == 0  # the in-sequence poll was answered live: no restart needed
+
+
+# --------------------------------------------------------------------------------------
+# The CLI fails closed when no baseline was proven.
+# --------------------------------------------------------------------------------------
+
+
+def test_cli_fuzz_exits_1_without_a_report_when_the_baseline_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreachable upstream: exit 1, a line naming the baseline failure, no report written."""
+    from typer.testing import CliRunner
+
+    from interlock.cli import app
+    from interlock.osdp.attacks import fuzz
+
+    monkeypatch.setattr(fuzz, "_CONNECT_ATTEMPTS", 1)
+    monkeypatch.setattr(fuzz, "_CONNECT_DELAY", 0.0)
+    report_path = tmp_path / "fuzz-report.md"
+    result = CliRunner().invoke(
+        app,
+        [
+            "osdp",
+            "fuzz",
+            "--upstream-host",
+            "127.0.0.1",
+            "--upstream-port",
+            str(_free_port()),
+            "-o",
+            str(report_path),
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, FuzzBaselineError), result.exception
+    assert "baseline" in result.output.lower()
+    assert "docker-compose.fuzz.yml" in result.output
+    assert not report_path.exists()
