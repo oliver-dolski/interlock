@@ -9,6 +9,8 @@ mapped Enterprise (primary) and ICS (secondary) ids.
 from __future__ import annotations
 
 import ast
+import importlib
+import pkgutil
 import re
 from pathlib import Path
 from types import ModuleType
@@ -17,8 +19,9 @@ import pytest
 
 from interlock import report
 from interlock.osdp import attack_map, codec, constants, framer
+from interlock.osdp import attacks as attacks_package
 from interlock.osdp.attack_map import ACCESS_VECTOR, ATTACK_VERSION, MAPPINGS, technique_names
-from interlock.osdp.attacks import downgrade, keyset, sniff, weak_key
+from interlock.osdp.attacks import downgrade, fuzz, keyset, replay, sniff, spoof, weak_key
 from interlock.osdp.attacks import enumerate as enumerate_attack
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction
@@ -57,6 +60,10 @@ _MODULE_CONSTANTS: dict[str, list[tuple[ModuleType, str, str]]] = {
     "weak-key": [(weak_key, "_TECHNIQUE", "_ICS_TECHNIQUE")],
     "keyset": [(keyset, "_TECHNIQUE", "_ICS_TECHNIQUE")],
     "downgrade": [(downgrade, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "replay": [(replay, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "cve-2024-52288": [(replay, "_CVE_TECHNIQUE", "_CVE_ICS_TECHNIQUE")],
+    "spoof": [(spoof, "_TECHNIQUE", "_ICS_TECHNIQUE")],
+    "fuzz": [(fuzz, "_TECHNIQUE", "_ICS_TECHNIQUE")],
 }
 
 
@@ -272,3 +279,89 @@ def test_keyset_finding_carries_the_mapped_ids() -> None:
     assert findings[0].attack_technique == "T1040"
     assert findings[0].attack_technique_ics == "T0842"
     _assert_complete(findings[0], "keyset")
+
+
+# --------------------------------------------------------------------------------------
+# Active attacks driven by fakes: Findings carry the mapped ids.
+# --------------------------------------------------------------------------------------
+
+
+def _flipping_probe() -> tuple[list[bytes], replay.Inject, replay.LockStateProbe]:
+    """Return (injected log, inject, probe): locked until the first injection, then unlocked."""
+    injected: list[bytes] = []
+
+    def inject(frame_bytes: bytes) -> None:
+        injected.append(frame_bytes)
+
+    return injected, inject, lambda: bool(injected)
+
+
+def test_replay_finding_carries_the_replay_ids() -> None:
+    _injected, inject, probe = _flipping_probe()
+    findings = replay.run_replay([b"\x53\x01"], inject, probe)
+    assert [f.id for f in findings] == ["ATK-05a-replay-card-exchange"]
+    assert findings[0].attack_technique == "T1557"
+    assert findings[0].attack_technique_ics == "T1692.002"
+    _assert_complete(findings[0], "replay")
+
+
+def test_cve_replay_finding_carries_the_cve_ids() -> None:
+    _injected, inject, probe = _flipping_probe()
+    findings = replay.run_cve_replay([b"\x53\x01"], inject, probe)
+    assert [f.id for f in findings] == ["ATK-05b-cve-2024-52288-rmac-replay"]
+    assert findings[0].attack_technique == "T1557"
+    assert findings[0].attack_technique_ics == "T0830"
+    _assert_complete(findings[0], "cve-2024-52288")
+
+
+def test_replay_and_cve_replay_share_enterprise_but_not_ics() -> None:
+    assert MAPPINGS["replay"].enterprise == MAPPINGS["cve-2024-52288"].enterprise == "T1557"
+    assert MAPPINGS["replay"].ics != MAPPINGS["cve-2024-52288"].ics
+
+
+def test_spoof_finding_carries_the_mapped_ids() -> None:
+    state = {"unlocked": False}
+
+    def inject() -> None:
+        state["unlocked"] = True
+
+    findings = spoof.run_spoof(inject, lambda: state["unlocked"])
+    assert [f.id for f in findings] == ["ATK-08-spoof-unlock"]
+    assert findings[0].attack_technique == "T1565.002"
+    assert findings[0].attack_technique_ics == "T1692.001"
+    _assert_complete(findings[0], "spoof")
+
+
+def test_fuzz_finding_carries_the_mapped_ids() -> None:
+    findings = fuzz.run_fuzz(fuzz.craft_poll(), lambda _frame: False, stop_on_failure=True)
+    assert len(findings) == 1, findings
+    assert findings[0].id.startswith("ATK-07-fuzz-")
+    assert findings[0].attack_technique == "T1499.004"
+    assert findings[0].attack_technique_ics == "T0814"
+    _assert_complete(findings[0], "fuzz")
+
+
+# --------------------------------------------------------------------------------------
+# Coverage: every map key is consumed, and no attack module keeps an id of its own.
+# --------------------------------------------------------------------------------------
+
+
+def test_every_mapping_key_is_consumed_by_a_module_constant() -> None:
+    assert set(_MODULE_CONSTANTS) == set(MAPPINGS)
+
+
+def test_no_attack_module_holds_a_technique_constant_outside_the_map() -> None:
+    """A technique constant that the table does not list (a new attack, a stray literal) fails."""
+    listed = {
+        (module.__name__, name)
+        for entries in _MODULE_CONSTANTS.values()
+        for module, enterprise_name, ics_name in entries
+        for name in (enterprise_name, ics_name)
+    }
+    found: set[tuple[str, str]] = set()
+    for info in pkgutil.iter_modules(attacks_package.__path__):
+        module = importlib.import_module(f"{attacks_package.__name__}.{info.name}")
+        for name in vars(module):
+            if name.endswith("TECHNIQUE"):
+                found.add((module.__name__, name))
+    assert found == listed
