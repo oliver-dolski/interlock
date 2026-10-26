@@ -1,0 +1,20 @@
+# Fuzz override (ATK-07): free the lab PD's single connection for interlock's fuzzer.
+# The PD (lab/osdp/tcp_channel.listen) accepts exactly one connection and then closes its
+# listener, so the fuzzer can only reach it when nothing else holds that connection: the CP
+# idles instead of dialling the PD, and the attacker idles instead of running a relay, so
+# interlock.osdp.attacks.fuzz is run inside it via docker compose exec and holds the PD's
+# only connection for the whole sweep.
+#
+# For the attacker service only, this mounts ./src read-only so the stdlib-only fuzzer is
+# importable and sets PYTHONPATH. It publishes nothing to the host and does not touch the
+# internal labnet, so SAFE-01 containment is unchanged.
+services:
+  cp:
+    command: ["sleep", "infinity"]
+  attacker:
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./src:/app/src:ro

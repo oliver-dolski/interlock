@@ -20,22 +20,32 @@ single source of that order; ``fuzz_sweep`` and ``run_fuzz`` are both built on i
   robust PD is a clean run (every injection leaves it live -> ``[]``); a frame that knocks it
   out (crash / hang / desync: silence or NAK to a follow-up valid poll) yields one
   ``Finding`` carrying the mutation name and the seed, so the report is reproducible.
+- ``fuzz_lab(upstream, ...)`` drives the sweep against a lab PD over ONE persistent TCP
+  connection. The lab PD (lab/osdp/tcp_channel.listen) accepts exactly one connection and
+  then closes its listener, so a probe that dialled a fresh connection per exchange read
+  every refused connection as "PD dead" and reported nine false HIGH findings. The
+  persistent probe connects once (retrying while the PD comes up), proves a live baseline
+  with a valid sequence-0 CMD_POLL before the first mutation (``FuzzBaselineError``
+  otherwise, so no verdict is ever drawn from an unreachable PD), and after each corrupted
+  frame drains the PD's reply to it, sends a valid CMD_POLL with the next sequence
+  (1 -> 2 -> 3 -> 1) and, if that is not answered live, one sequence-0 restart poll.
 - ``register`` adds the ``fuzz`` subcommand (``--seed`` / ``--variants``; lab default;
   ``--physical`` behind the SAFE-02 consent gate).
 
 Import discipline: importable with the standard library plus the stdlib-only Phase 3 modules
-(codec/constants/mutate). ``typer``, ``report`` and ``safety`` are imported lazily.
+(codec/constants/framer/mutate). ``typer``, ``report`` and ``safety`` are imported lazily.
 """
 
 from __future__ import annotations
 
 import random
 import socket
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from interlock.osdp import codec, constants
+from interlock.osdp import codec, constants, framer
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.mutate import Mutation, mutate
 from interlock.plugin import Finding, Severity
@@ -49,8 +59,32 @@ _DEFAULT_UPSTREAM = ("pd", 10000)
 _DEFAULT_PD_ADDRESS = 101
 _READ_SIZE = 4096
 
+# The lab PD logs "listening" just before it calls accept(); retry the one connection across
+# that window (and across a slow container start) before giving up.
+_CONNECT_ATTEMPTS = 10
+_CONNECT_DELAY = 1.0
+# How long to wait for a reply to a valid poll, and how long to drain whatever the PD sends
+# back to a corrupted frame so that reply is never mistaken for the follow-up poll's reply.
+_REPLY_TIMEOUT = 2.0
+_DRAIN_SECONDS = 0.3
+
 # ATK-07 free-text ATT&CK id: Endpoint Denial of Service (T1499). Phase 5 enriches it.
 _TECHNIQUE = "T1499"
+
+# Lowercase substrings of LibOSDP PD log lines showing that a corrupted frame reached the PD's
+# parser and was rejected there. A lab oracle (matched case-insensitively against the PD log):
+# a clean sweep only proves robustness if the corruptions actually reached the parser.
+LIBOSDP_REJECTION_MARKERS: tuple[str, ...] = ("invalid crc", "sequence mismatch", "unknown cmd")
+
+
+class FuzzBaselineError(RuntimeError):
+    """The PD could not be reached or did not answer a valid baseline poll.
+
+    Raised before the first mutation is sent: without a proven live baseline on the same
+    connection, silence after a corruption cannot be told apart from a PD that was never
+    there, so no liveness verdict (and no finding) is possible.
+    """
+
 
 # An injection seam that only sends (no response needed): the counting/ordering primitive.
 Inject = Callable[[bytes], None]
@@ -60,18 +94,22 @@ Inject = Callable[[bytes], None]
 LivenessProbe = Callable[[bytes], bool]
 
 
-def craft_poll(address: int = _DEFAULT_PD_ADDRESS) -> bytes:
+def craft_poll(address: int = _DEFAULT_PD_ADDRESS, *, sequence: int = 1) -> bytes:
     """Return a known-good CMD_POLL frame (cp->pd) built via ``codec.encode``.
 
     This is the good seed the fuzzer mutates and the valid frame the liveness probe sends to
-    confirm the PD is still polling. control 0x05 = CRC bit set, sequence 1 (the lab CP's own
-    steady-state poll). The reply flag is clear because this is a command travelling CP->PD.
+    confirm the PD is still polling. The control byte is the CRC bit plus ``sequence``; the
+    default sequence 1 gives control 0x05 (the lab CP's own steady-state poll), which is the
+    seed of the mutation corpus. Sequence 0 is the OSDP restart poll. The reply flag is clear
+    because this is a command travelling CP->PD.
     """
+    if not 0 <= sequence <= constants.PKT_CONTROL_SQN:
+        raise ValueError(f"OSDP sequence must be 0..3, got {sequence}")
     return codec.encode(
         OsdpFrame(
             had_mark=True,
             address=address & ~constants.ADDR_REPLY_FLAG,
-            control=0x05,
+            control=constants.PKT_CONTROL_CRC | sequence,
             scb=b"",
             code=constants.CMD_POLL,
             data=b"",
@@ -161,31 +199,12 @@ def run_fuzz(
     return findings
 
 
-def _exchange(host: str, port: int, frame_bytes: bytes, *, timeout: float) -> bytes:
-    """Send ``frame_bytes`` to the PD over a fresh connection and return one raw reply.
-
-    Returns ``b""`` if the connection or read fails, so a dead / hung PD reads as silence.
-    """
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(frame_bytes)
-            try:
-                return sock.recv(_READ_SIZE)
-            except OSError:
-                return b""
-    except OSError:
-        return b""
-
-
 def _reply_is_live(reply: bytes) -> bool:
     """Return True if ``reply`` shows the PD still polling: a decodable, non-NAK reply.
 
     Silence (``b""``) reads as crash / hang; a REPLY_NAK reads as desync; anything that
     decodes to a valid non-NAK reply frame means the PD is still alive and answering polls.
     """
-    from interlock.osdp import framer
-
     for raw in framer.iter_frames(reply):
         try:
             frame = codec.decode(raw)
@@ -196,26 +215,103 @@ def _reply_is_live(reply: bytes) -> bool:
     return False
 
 
-def _socket_probe(
-    host: str,
-    port: int,
-    good_poll: bytes,
-    *,
-    timeout: float = 2.0,
-) -> LivenessProbe:
-    """Return a ``LivenessProbe`` that injects over TCP, then checks the PD still polls.
+def _next_sequence(sequence: int) -> int:
+    """Return the OSDP sequence after ``sequence``: 0 -> 1 -> 2 -> 3 -> 1 (0 only on restart)."""
+    return sequence % constants.PKT_CONTROL_SQN + 1
 
-    Each call sends the (possibly malformed) frame, then sends ``good_poll`` and inspects the
-    reply: a decodable non-NAK reply means the PD survived the injection (live); silence or a
-    NAK means it did not. Used by the lab fuzz driver where interlock dials the PD directly.
+
+class _PersistentProbe:
+    """A ``LivenessProbe`` over ONE connected socket to the PD, held for the whole sweep.
+
+    Mirrors ``_serial_probe``'s one-endpoint shape for TCP. ``baseline`` must succeed before
+    the probe is called: it proves the PD answers a valid sequence-0 poll on this very
+    connection. Each call then sends the corrupted frame, drains the PD's reply to it, sends a
+    valid poll with the next sequence and, if that is not answered live, one sequence-0
+    restart poll. Any socket error or a closed connection reads as "PD gone" (``False``).
     """
 
-    def probe(mutated: bytes) -> bool:
-        _exchange(host, port, mutated, timeout=timeout)
-        reply = _exchange(host, port, good_poll, timeout=timeout)
-        return _reply_is_live(reply)
+    def __init__(
+        self,
+        sock: socket.socket,
+        address: int,
+        *,
+        timeout: float = _REPLY_TIMEOUT,
+        drain: float = _DRAIN_SECONDS,
+    ) -> None:
+        self._sock = sock
+        self._address = address
+        self._timeout = timeout
+        self._drain = drain
+        self._sequence = 0
 
-    return probe
+    def baseline(self) -> None:
+        """Send a sequence-0 CMD_POLL and require a live reply, else ``FuzzBaselineError``."""
+        try:
+            reply = self._poll(0)
+        except OSError as exc:
+            raise FuzzBaselineError(
+                f"baseline CMD_POLL failed on the PD connection: {exc}"
+            ) from exc
+        if not _reply_is_live(reply):
+            raise FuzzBaselineError(
+                "the PD did not answer a valid sequence-0 CMD_POLL with a decodable non-NAK "
+                "reply, so no liveness verdict is possible"
+            )
+        self._sequence = 0
+
+    def __call__(self, mutated: bytes) -> bool:
+        try:
+            self._sock.sendall(mutated)
+            self._read(self._drain, until_frame=False)  # the PD's answer to the corruption
+            if _reply_is_live(self._poll(_next_sequence(self._sequence))):
+                return True
+            return _reply_is_live(self._poll(0))  # one restart before calling the PD dead
+        except OSError:
+            return False
+
+    def _poll(self, sequence: int) -> bytes:
+        """Send a valid CMD_POLL with ``sequence`` and return the raw reply bytes read."""
+        self._sequence = sequence
+        self._sock.sendall(craft_poll(self._address, sequence=sequence))
+        return self._read(self._timeout, until_frame=True)
+
+    def _read(self, window: float, *, until_frame: bool) -> bytes:
+        """Read for up to ``window`` seconds; stop early once a frame is complete if asked.
+
+        A closed connection raises ``ConnectionError`` (the PD went away mid-sweep); running
+        out of time is not an error and returns whatever arrived.
+        """
+        buffer = b""
+        deadline = time.monotonic() + window
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return buffer
+            self._sock.settimeout(remaining)
+            try:
+                chunk = self._sock.recv(_READ_SIZE)
+            except TimeoutError:
+                return buffer
+            if not chunk:
+                raise ConnectionError("the PD closed the connection")
+            buffer += chunk
+            if until_frame and any(True for _ in framer.iter_frames(buffer)):
+                return buffer
+
+
+def _connect(host: str, port: int, *, attempts: int, delay: float) -> socket.socket:
+    """Open the single PD connection, retrying; ``FuzzBaselineError`` after the last attempt."""
+    last: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            return socket.create_connection((host, port), timeout=_REPLY_TIMEOUT)
+        except OSError as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+    raise FuzzBaselineError(
+        f"could not connect to the PD at {host}:{port} after {attempts} attempts: {last}"
+    )
 
 
 def fuzz_lab(
@@ -224,16 +320,26 @@ def fuzz_lab(
     address: int = _DEFAULT_PD_ADDRESS,
     seed: int = 0,
     variants: int = 0,
+    connect_attempts: int | None = None,
+    connect_delay: float | None = None,
 ) -> list[Finding]:
-    """Fuzz the lab PD over TCP and return any crash / hang / desync Findings.
+    """Fuzz the lab PD over one persistent TCP connection and return any failure Findings.
 
-    Builds a known-good CMD_POLL for ``address``, dials the upstream PD, and runs the
-    deterministic sweep (then seeded variants) through a liveness probe. A robust PD yields
-    ``[]`` (clean run / true negative); a failure is reported with its mutation name and seed.
+    Opens one connection to ``upstream`` (retrying while the PD comes up), proves a live
+    baseline with a valid sequence-0 poll, then runs the deterministic sweep (then seeded
+    variants) through the persistent probe on that same connection. A robust PD yields ``[]``
+    (clean run / true negative). Raises ``FuzzBaselineError`` when the PD cannot be reached or
+    does not answer the baseline: a sweep against an absent PD would only report silence.
     """
-    good_poll = craft_poll(address)
-    probe = _socket_probe(upstream[0], upstream[1], good_poll)
-    return run_fuzz(good_poll, probe, seed=seed, variants=variants)
+    attempts = _CONNECT_ATTEMPTS if connect_attempts is None else connect_attempts
+    delay = _CONNECT_DELAY if connect_delay is None else connect_delay
+    sock = _connect(upstream[0], upstream[1], attempts=attempts, delay=delay)
+    try:
+        probe = _PersistentProbe(sock, address)
+        probe.baseline()
+        return run_fuzz(craft_poll(address), probe, seed=seed, variants=variants)
+    finally:
+        sock.close()
 
 
 def register(app: typer.Typer) -> None:
@@ -323,7 +429,7 @@ def register(app: typer.Typer) -> None:
 def _serial_probe(endpoint: object, good_poll: bytes, *, timeout: float = 2.0) -> LivenessProbe:
     """Return a ``LivenessProbe`` over a consented pyserial endpoint (active --physical).
 
-    Mirrors ``_socket_probe`` for a real port: write the malformed frame, write the valid poll,
+    The serial counterpart of ``_PersistentProbe``: write the malformed frame, write the valid poll,
     read one reply, and classify liveness. Kept dependency-light so the module imports with no
     pyserial at module scope; ``endpoint`` is the ``serial.Serial`` from ``open_physical_endpoint``.
     """
