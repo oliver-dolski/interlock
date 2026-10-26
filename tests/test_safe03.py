@@ -16,8 +16,10 @@ SAFE-02 physical path.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
+import string
 from pathlib import Path
 from typing import NamedTuple
 
@@ -143,9 +145,77 @@ class KeyLiteral(NamedTuple):
         return f"{self.path}:{self.line} {self.value.hex()}"
 
 
+def _int_constant(node: ast.expr) -> int | None:
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    return None
+
+
+def _range_bytes(node: ast.Call) -> bytes | None:
+    """``bytes(range(a, b))`` with integer constants and ``b - a == 16``, else None."""
+    if not (isinstance(node.func, ast.Name) and node.func.id == "bytes" and len(node.args) == 1):
+        return None
+    inner = node.args[0]
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "range"
+        and len(inner.args) == 2
+        and not inner.keywords
+    ):
+        return None
+    start, stop = (_int_constant(arg) for arg in inner.args)
+    if start is None or stop is None or stop - start != _KEY_LENGTH:
+        return None
+    if not 0 <= start < stop <= 0x100:
+        return None
+    return bytes(range(start, stop))
+
+
+def _is_ascii_word(value: bytes) -> bool:
+    return all(0x20 <= byte <= 0x7E for byte in value) and any(
+        chr(byte).isalpha() for byte in value
+    )
+
+
+def _key_value(node: ast.AST) -> bytes | None:
+    """The 16 bytes a key-like node spells, or None if the node is not key-like.
+
+    The printable-ASCII word exemption covers only a bytes literal written as text, such as a
+    16-character token; a range or hex spelling of the same bytes is still a key literal.
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bytes) and len(value) == _KEY_LENGTH and not _is_ascii_word(value):
+            return value
+        if (
+            isinstance(value, str)
+            and len(value) == 2 * _KEY_LENGTH
+            and all(char in string.hexdigits for char in value)
+        ):
+            return bytes.fromhex(value)
+    if isinstance(node, ast.Call):
+        return _range_bytes(node)
+    return None
+
+
+def _allowed(value: bytes, path: str) -> bool:
+    prefixes = _ALLOWED_KEYS.get(value)
+    return prefixes is not None and path.startswith(prefixes)
+
+
 def find_key_literals(source: str, path: str) -> list[KeyLiteral]:
-    """Return every 16-byte key-like literal in ``source`` that the allow-list does not cover."""
-    return []
+    """Return every 16-byte key-like literal in ``source`` that the allow-list does not cover.
+
+    Key-like is a 16-byte bytes constant, a 32-hex-char string or ``bytes(range(a, a + 16))``.
+    ``path`` is the repo-relative POSIX path the allow-list prefixes are matched against.
+    """
+    hits = [
+        KeyLiteral(path, node.lineno, value)
+        for node in ast.walk(ast.parse(source, filename=path))
+        if (value := _key_value(node)) is not None and not _allowed(value, path)
+    ]
+    return sorted(hits, key=lambda hit: hit.line)
 
 
 def _scanned_files() -> list[Path]:
@@ -245,8 +315,22 @@ _FORBIDDEN_IMPORTS = frozenset(
 
 
 def forbidden_imports(source: str) -> list[str]:
-    """Return every import in ``source`` that names a module or object of the physical path."""
-    return []
+    """Return every import in ``source`` that names a module or object of the physical path.
+
+    An import is forbidden when a dotted part of its module path or one of the names it binds
+    is in ``_FORBIDDEN_IMPORTS``; each is reported as ``line N: <the import statement>``.
+    """
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            parts = {part for alias in node.names for part in alias.name.split(".")}
+        elif isinstance(node, ast.ImportFrom):
+            parts = set((node.module or "").split(".")) | {alias.name for alias in node.names}
+        else:
+            continue
+        if parts & _FORBIDDEN_IMPORTS:
+            found.append((node.lineno, ast.unparse(node)))
+    return [f"line {line}: {statement}" for line, statement in sorted(found)]
 
 
 def test_assess_help_offers_no_physical_option() -> None:
