@@ -39,10 +39,14 @@ from rich.table import Table
 
 import interlock
 from interlock import report
-from interlock.osdp import lab_session
+from interlock.osdp import constants, lab_session, secure_channel
+from interlock.osdp.attacks import downgrade
 from interlock.osdp.attacks.enumerate import run_enumerate
 from interlock.osdp.attacks.fuzz import LIBOSDP_REJECTION_MARKERS
+from interlock.osdp.attacks.keyset import run_keyset
 from interlock.osdp.attacks.sniff import decode_chunks, run_sniff
+from interlock.osdp.attacks.weak_key import run_weak_key
+from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.lab_session import LabError, LabSession
 from interlock.osdp.tap_capture import CP2PD_PATH, PD2CP_PATH
 from interlock.osdp.transport import Direction
@@ -137,24 +141,38 @@ _SNIFF_PROFILE = "cleartext"
 _SNIFF_OVERRIDES = ("docker-compose.tap.yml",)
 
 
-def _sniff_enumerate(session: LabSession, context: dict[str, object]) -> StepOutput:
-    """Read both live tap captures and fold them into ATK-01 and ATK-02 findings."""
-    with session.scenario(_SNIFF_PROFILE, _SNIFF_OVERRIDES) as lab:
-        _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
-        _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
-        cp2pd = lab.read_capture(CP2PD_PATH.as_posix())
-        pd2cp = lab.read_capture(PD2CP_PATH.as_posix())
+Frames = list[tuple[Direction, OsdpFrame]]
+
+
+def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> tuple[Frames, int]:
+    """Gate on a full session, read both per-direction captures and decode them.
+
+    Returns the decoded frames and the number of captured bytes. Raises ``Inconclusive``
+    when the PD never came online, no card-read event was seen or a capture is empty.
+    """
+    _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
+    _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
+    cp2pd = lab.read_capture(CP2PD_PATH.as_posix())
+    pd2cp = lab.read_capture(PD2CP_PATH.as_posix())
     if not cp2pd:
         raise Inconclusive("the cp->pd tap capture is empty")
     if not pd2cp:
         raise Inconclusive("the pd->cp tap capture is empty")
+    frames = decode_chunks(
+        [(Direction.cp_to_pd, cp2pd), (Direction.pd_to_cp, pd2cp)], max_frames=max_frames
+    )
+    return frames, len(cp2pd) + len(pd2cp)
 
-    frames = decode_chunks([(Direction.cp_to_pd, cp2pd), (Direction.pd_to_cp, pd2cp)])
+
+def _sniff_enumerate(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Read both live tap captures and fold them into ATK-01 and ATK-02 findings."""
+    with session.scenario(_SNIFF_PROFILE, _SNIFF_OVERRIDES) as lab:
+        frames, captured = _capture_session(lab)
     context["cleartext_frames"] = frames
     findings = [*run_sniff(frames), *run_enumerate(frames)]
     return StepOutput(
         findings=tuple(findings),
-        detail=f"{len(frames)} frames decoded from {len(cp2pd) + len(pd2cp)} captured bytes",
+        detail=f"{len(frames)} frames decoded from {captured} captured bytes",
     )
 
 
@@ -245,6 +263,64 @@ def _fuzz(session: LabSession, context: dict[str, object]) -> StepOutput:
     )
 
 
+# weak-key-keyset: the install-mode sc-scbkd lab under the read-only tap.
+_WEAK_KEY_PROFILE = "sc-scbkd"
+_WEAK_KEY_OVERRIDES = ("docker-compose.tap.yml",)
+# The default 200 can stop decoding before CMD_KEYSET on the install-mode bus.
+_WEAK_KEY_MAX_FRAMES = 400
+
+
+def _weak_key_keyset(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Check the live Secure Channel handshake for SCBK-D and decrypt any KEYSET on the bus."""
+    with session.scenario(_WEAK_KEY_PROFILE, _WEAK_KEY_OVERRIDES) as lab:
+        frames, captured = _capture_session(lab, max_frames=_WEAK_KEY_MAX_FRAMES)
+    cp_codes = {frame.code for direction, frame in frames if direction is Direction.cp_to_pd}
+    if constants.CMD_CHLNG not in cp_codes:
+        raise Inconclusive(
+            "no Secure Channel handshake captured (no CMD_CHLNG cp->pd), so neither the key "
+            "check nor the KEYSET decryption had anything to work on"
+        )
+    findings = [*run_weak_key(frames), *run_keyset(frames)]
+    return StepOutput(
+        findings=tuple(findings),
+        detail=f"{len(frames)} frames decoded from {captured} captured bytes",
+    )
+
+
+# downgrade: the downgrade profile twice, untouched under the tap, then under the relay.
+_DOWNGRADE_PROFILE = "downgrade"
+_DOWNGRADE_BASELINE = ("docker-compose.tap.yml",)
+_DOWNGRADE_ATTACKED = ("docker-compose.downgrade.yml",)
+
+
+def _downgrade(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Capture an untouched secure session, then one through the stripping relay; compare."""
+    with session.scenario(_DOWNGRADE_PROFILE, _DOWNGRADE_BASELINE) as lab:
+        baseline, _ = _capture_session(lab)
+    if not secure_channel.detect_state(baseline).secure:
+        raise Inconclusive("baseline was not Secure Channel")
+    if not downgrade._advertises_communication_security(baseline):
+        raise Inconclusive("baseline advertised no CommunicationSecurity to strip")
+
+    with session.scenario(_DOWNGRADE_PROFILE, _DOWNGRADE_ATTACKED) as lab:
+        attacked, _ = _capture_session(lab)
+    findings = downgrade.run_downgrade(baseline, attacked)
+    if findings:
+        return StepOutput(
+            findings=tuple(findings),
+            detail="the Secure Channel baseline was forced to clear-text by the in-path rewrite",
+        )
+    if secure_channel.detect_state(attacked).secure:
+        return StepOutput(
+            findings=(),
+            detail=(
+                "the attacked session stayed Secure Channel: the in-path rewrite did not force "
+                "clear-text"
+            ),
+        )
+    raise Inconclusive("the downgrade verdict found no proof either way")
+
+
 STEPS: tuple[Step, ...] = (
     Step(
         key="sniff-enumerate",
@@ -274,6 +350,34 @@ STEPS: tuple[Step, ...] = (
         ),
         clean_detail="The PD answered every follow-up poll after each corruption.",
         attacks=(("fuzz", "ATK-07-fuzz-"),),
+    ),
+    Step(
+        key="weak-key-keyset",
+        title="Weak Secure Channel key and KEYSET recovery",
+        profile=_WEAK_KEY_PROFILE,
+        overrides=_WEAK_KEY_OVERRIDES,
+        run=_weak_key_keyset,
+        method=(
+            "passive: read-only TCP tap on the install-mode Secure Channel bus; AES-verified "
+            "SCBK-D check and KEYSET payload decryption on the host"
+        ),
+        clean_detail=(
+            "The captured handshake used no known weak key and no KEYSET payload decrypted."
+        ),
+        attacks=(("weak-key", "ATK-06-"), ("keyset", "ATK-04-")),
+    ),
+    Step(
+        key="downgrade",
+        title="Secure Channel downgrade to clear-text",
+        profile=_DOWNGRADE_PROFILE,
+        overrides=(*_DOWNGRADE_BASELINE, *_DOWNGRADE_ATTACKED),
+        run=_downgrade,
+        method=(
+            "before/after pair: untouched session via the tap, then the inline relay stripping "
+            "CommunicationSecurity from REPLY_PDCAP"
+        ),
+        clean_detail="The attacked session stayed Secure Channel.",
+        attacks=(("downgrade", "ATK-03-"),),
     ),
 )
 
