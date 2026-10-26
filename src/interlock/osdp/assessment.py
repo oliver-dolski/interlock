@@ -2,7 +2,7 @@
 
 An assessment is an ordered tuple of ``Step``s. Each step brings one bundled lab scenario up
 through the 05-07 wrapper (``with session.scenario(profile, overrides) as lab:``), proves its
-lab precondition from the cp log sentinels, runs the existing Phase 4 verdict functions over
+lab precondition from the lab's own log sentinels, runs the existing Phase 4 verdict functions over
 live lab output and returns the findings. ``run_assessment`` runs every step in order and
 records one ``StepResult`` per step with an explicit ``Status``:
 
@@ -32,7 +32,7 @@ import time
 import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from rich.console import Console
 from rich.table import Table
@@ -40,7 +40,7 @@ from rich.table import Table
 import interlock
 from interlock import report
 from interlock.osdp import constants, lab_session, secure_channel
-from interlock.osdp.attacks import downgrade
+from interlock.osdp.attacks import downgrade, replay, spoof
 from interlock.osdp.attacks.enumerate import run_enumerate
 from interlock.osdp.attacks.fuzz import LIBOSDP_REJECTION_MARKERS
 from interlock.osdp.attacks.keyset import run_keyset
@@ -321,6 +321,160 @@ def _downgrade(session: LabSession, context: dict[str, object]) -> StepOutput:
     raise Inconclusive("the downgrade verdict found no proof either way")
 
 
+# The single lock-state sentinel the lab PD prints (lab/osdp/pd_driver.py), and its wait.
+LOCK_UNLOCKED = "interlock-lab: LOCK state=UNLOCKED"
+_LOCK_TIMEOUT = 120.0
+
+
+def _unlocked(lab: lab_session.LabHandle) -> bool:
+    """Return True when the PD's own log shows the lock-state sentinel."""
+    return LOCK_UNLOCKED in lab.logs("pd")
+
+
+def _arm(lab: lab_session.LabHandle, trigger: Path) -> None:
+    """Touch ``trigger`` in the attacker, arming its relay; a failed touch is a ``LabError``."""
+    path = PurePosixPath(trigger).as_posix()
+    result = lab.compose("exec", "-T", "attacker", "touch", path)
+    if result.returncode != 0:
+        raise LabError(
+            f"arming {path} in the attacker failed (exit {result.returncode}): "
+            f"{_output_tail(result)}"
+        )
+
+
+def _require_locked(lab: lab_session.LabHandle) -> None:
+    """Raise ``Inconclusive`` when the PD is already unlocked before the step arms anything."""
+    if _unlocked(lab):
+        raise Inconclusive(
+            "the PD was already unlocked before arming, so no transition could be attributed "
+            "to the attack"
+        )
+
+
+def _arm_once(lab: lab_session.LabHandle, trigger: Path) -> Callable[..., None]:
+    """Return an inject that arms ``trigger`` on its first call and waits for the unlock.
+
+    The relay serves the live rewrite itself; later calls (one per captured frame) only
+    re-check, so the wait is bounded once rather than once per frame.
+    """
+    armed = False
+
+    def inject(*_frame: bytes) -> None:
+        nonlocal armed
+        if armed:
+            return
+        _arm(lab, trigger)
+        armed = True
+        lab.wait_for_log("pd", LOCK_UNLOCKED, timeout=_LOCK_TIMEOUT)
+
+    return inject
+
+
+_NO_TRANSITION = f"armed; no lock-state transition within {_LOCK_TIMEOUT:.0f} s"
+
+# spoof: the cleartext lab with the inline unlock-spoof relay, disarmed until its trigger.
+_SPOOF_PROFILE = "cleartext"
+_SPOOF_OVERRIDES = ("docker-compose.spoof.yml",)
+
+
+def _spoof(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Arm the unlock-spoof relay and watch the PD's lock state flip."""
+    with session.scenario(_SPOOF_PROFILE, _SPOOF_OVERRIDES) as lab:
+        _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
+        _require_locked(lab)
+        findings = spoof.run_spoof(_arm_once(lab, spoof._TRIGGER_PATH), lambda: _unlocked(lab))
+    if findings:
+        return StepOutput(
+            findings=tuple(findings),
+            detail="the PD was locked before arming and logged UNLOCKED after the forged CMD_OUT",
+        )
+    return StepOutput(findings=(), detail=_NO_TRANSITION)
+
+
+# replay: the cleartext lab with the inline replay relay, disarmed until its trigger.
+_REPLAY_PROFILE = "cleartext"
+_REPLAY_OVERRIDES = ("docker-compose.replay.yml",)
+
+
+def _replay(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Replay the card read captured live by sniff-enumerate and watch the PD's lock state."""
+    frames = context.get("cleartext_frames")
+    if not isinstance(frames, list):
+        raise Inconclusive("no live clear-text capture from the sniff-enumerate step")
+    captured = replay.capture_card_exchange(frames)
+    if not captured:
+        raise Inconclusive("the live clear-text capture holds no REPLY_RAW card read to replay")
+
+    with session.scenario(_REPLAY_PROFILE, _REPLAY_OVERRIDES) as lab:
+        _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
+        _require_locked(lab)
+        findings = replay.run_replay(
+            captured, _arm_once(lab, replay._TRIGGER_PATH), lambda: _unlocked(lab)
+        )
+    if findings:
+        return StepOutput(
+            findings=tuple(findings),
+            detail=(
+                f"{len(captured)} card read(s) captured live; the PD was locked before arming "
+                "and logged UNLOCKED after"
+            ),
+        )
+    return StepOutput(findings=(), detail=_NO_TRANSITION)
+
+
+# cve-2024-52288-fixed: the sc-scbkd lab on the fixed LibOSDP core with the inline cve relay.
+_CVE_PROFILE = "sc-scbkd"
+_CVE_OVERRIDES = ("docker-compose.cve.yml",)
+CP_AUTHORISED = "interlock-lab: CP authorised unlock on card read"
+# The fixed core's own rejection of an out-of-state REPLY_RMAC_I (libosdp osdp_cp.c).
+RMAC_I_REJECTED = "Out of order REPLY_RMAC_I"
+_CVE_BASELINE_TIMEOUT = 90.0
+_CVE_OUTCOME_TIMEOUT = 90.0
+_CVE_POLL_INTERVAL = 2.0
+
+# The relay replays the live secure frames in-band; run_cve_replay only needs one element so
+# it issues exactly one inject (the arm and the bounded wait), not the wire frames themselves.
+_ARM_TOKEN = b"arm-inline-relay"
+
+
+def _cve_fixed(session: LabSession, context: dict[str, object]) -> StepOutput:
+    """Replay REPLY_RMAC_I at the fixed core; only its own rejection line proves the fix."""
+    with session.scenario(_CVE_PROFILE, _CVE_OVERRIDES) as lab:
+        _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
+        if not lab.wait_for_log("cp", CP_AUTHORISED, timeout=_CVE_BASELINE_TIMEOUT):
+            raise Inconclusive("no genuine baseline authorisation")
+        baseline = lab.logs("cp").count(CP_AUTHORISED)
+
+        def arm(_token: bytes) -> None:
+            _arm(lab, replay._CVE_TRIGGER_PATH)
+            deadline = lab.clock() + _CVE_OUTCOME_TIMEOUT
+            while lab.clock() < deadline:
+                cp_log = lab.logs("cp")
+                if RMAC_I_REJECTED in cp_log or cp_log.count(CP_AUTHORISED) > baseline:
+                    return
+                lab.sleep(_CVE_POLL_INTERVAL)
+
+        findings = replay.run_cve_replay(
+            [_ARM_TOKEN], arm, lambda: lab.logs("cp").count(CP_AUTHORISED) > baseline
+        )
+        cp_log = lab.logs("cp")
+    if findings:
+        return StepOutput(
+            findings=tuple(findings),
+            detail=(
+                f"the fixed core re-authorised: {cp_log.count(CP_AUTHORISED)} authorisations "
+                f"after a baseline of {baseline}"
+            ),
+        )
+    rejection = next((line for line in cp_log.splitlines() if RMAC_I_REJECTED in line), None)
+    if rejection is None:
+        raise Inconclusive("the replay never reached the REPLY_RMAC_I fix path")
+    return StepOutput(
+        findings=(),
+        detail=f'fixed LibOSDP 3.0.8 rejected the replayed REPLY_RMAC_I: "{rejection.strip()}"',
+    )
+
+
 STEPS: tuple[Step, ...] = (
     Step(
         key="sniff-enumerate",
@@ -378,6 +532,50 @@ STEPS: tuple[Step, ...] = (
         ),
         clean_detail="The attacked session stayed Secure Channel.",
         attacks=(("downgrade", "ATK-03-"),),
+    ),
+    Step(
+        key="spoof",
+        title="Unlock spoofing by command injection",
+        profile=_SPOOF_PROFILE,
+        overrides=_SPOOF_OVERRIDES,
+        run=_spoof,
+        method=(
+            "active: inline rewrite relay turns an in-flight CMD_POLL into a forged CMD_OUT on "
+            "a trigger file; oracle is the PD's own lock-state log line"
+        ),
+        clean_detail=_NO_TRANSITION,
+        attacks=(("spoof", "ATK-08-"),),
+    ),
+    Step(
+        key="replay",
+        title="Clear-text card-read replay",
+        profile=_REPLAY_PROFILE,
+        overrides=_REPLAY_OVERRIDES,
+        run=_replay,
+        method=(
+            "active: the card read comes from the sniff-enumerate step's live capture; live "
+            "proof via the in-path relay, which serves the same POLL-to-CMD_OUT rewrite as "
+            "spoof on the replay trigger; the byte-exact re-injection of the captured "
+            "REPLY_RAW is proven by host unit tests (tests/osdp/test_attacks_replay.py), not "
+            "on the live bus"
+        ),
+        clean_detail=_NO_TRANSITION,
+        attacks=(("replay", "ATK-05a-"),),
+    ),
+    Step(
+        key="cve-2024-52288-fixed",
+        title="CVE-2024-52288 REPLY_RMAC_I replay against the fixed LibOSDP core",
+        profile=_CVE_PROFILE,
+        overrides=_CVE_OVERRIDES,
+        run=_cve_fixed,
+        method=(
+            "active: inline relay replays the live-captured REPLY_RMAC_I-first secure blob "
+            "aligned to the CP's 2-bit sequence; oracle is the controller's re-authorisation "
+            "count and its rejection line; the pinned-vulnerable core is not part of the "
+            "default run (D-03)"
+        ),
+        clean_detail="The fixed core rejected the replayed REPLY_RMAC_I.",
+        attacks=(("cve-2024-52288", "ATK-05b-"),),
     ),
 )
 
