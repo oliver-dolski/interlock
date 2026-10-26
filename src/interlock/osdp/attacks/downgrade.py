@@ -30,7 +30,7 @@ the forwarded, post-rewrite bytes to one capture file per direction, so the @lab
 read the attacked (downgraded) session back out exactly as the read-only tap-capture does.
 
 Import discipline: importable with the standard library plus the stdlib-only Phase 3
-modules (codec/framer/constants/transport). ``secure_channel`` (cryptography), ``typer``,
+modules (codec/framer/constants/transport) and the stdlib-only ``attack_map``. ``secure_channel`` (cryptography), ``typer``,
 ``report`` and ``safety`` are imported lazily inside the functions that need them.
 """
 
@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from interlock.osdp import codec, constants, framer
+from interlock.osdp.attack_map import MAPPINGS
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction, TCPTap, Transform
 from interlock.plugin import Finding, Severity
@@ -53,8 +54,9 @@ if TYPE_CHECKING:
 # VERIFIED: OSDP capability function-code table (mirrors enumerate.CAPABILITY_CODES 0x09).
 _COMMUNICATION_SECURITY = 0x09
 
-# ATK-03 free-text ATT&CK id: Impair Defenses - Downgrade (T1562.010). Phase 5 enriches it.
-_TECHNIQUE = "T1562.010"
+# ATK-03 ATT&CK ids (Enterprise primary, ICS secondary), read from interlock.osdp.attack_map.
+_TECHNIQUE = MAPPINGS["downgrade"].enterprise
+_ICS_TECHNIQUE = MAPPINGS["downgrade"].ics
 
 # Lab defaults: listen in the attacker (inline MITM) position and rewrite toward the PD.
 _DEFAULT_LISTEN_PORT = 10000
@@ -205,6 +207,7 @@ def run_downgrade(
                 "is clear-text (no SCB, no SCS). The before/after pair proves the downgrade."
             ),
             attack_technique=technique,
+            attack_technique_ics=_ICS_TECHNIQUE,
             remediation=(
                 "Enable and ENFORCE OSDP Secure Channel on the CP (EnforceSecure): a CP that "
                 "refuses a clear-text fallback cannot be downgraded by rewriting the PD's "
