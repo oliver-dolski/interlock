@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typer.testing import CliRunner
 
+from interlock import report
 from interlock.cli import app
 
 runner = CliRunner()
@@ -20,4 +21,6 @@ def test_run_demo_writes_report(tmp_path) -> None:
     result = runner.invoke(app, ["run", "demo", "-o", str(report_path)])
     assert result.exit_code == 0
     assert report_path.exists()
-    assert "DEMO-001" in report_path.read_text(encoding="utf-8")
+    text = report_path.read_text(encoding="utf-8")
+    assert "DEMO-001" in text
+    assert text.startswith("# interlock findings\n\n" + report.AUTHORIZED_USE_NOTICE)

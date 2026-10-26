@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from interlock import report
+import json
+
+from interlock import plugin, report
 from interlock.plugins.demo import DemoPlugin
 
 
@@ -29,3 +31,15 @@ def test_render_terminal_outputs_id_and_severity(capsys) -> None:
     captured = capsys.readouterr()
     assert finding.id in captured.out
     assert finding.severity.value in captured.out
+
+
+def test_write_json_round_trips_the_demo_finding_with_the_notice(tmp_path) -> None:
+    finding = DemoPlugin().run()[0]
+    report_path = tmp_path / "report.json"
+
+    report.write_json([finding], report_path)
+
+    document = json.loads(report_path.read_text(encoding="utf-8"))
+    assert document["schema_version"] == 1
+    assert document["notice"] == report.AUTHORIZED_USE_NOTICE
+    assert plugin.finding_from_dict(document["findings"][0]) == finding
