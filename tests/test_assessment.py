@@ -25,7 +25,7 @@ from typer.testing import CliRunner
 
 from interlock import report
 from interlock.cli import app
-from interlock.osdp import codec, constants, framer, lab_session, secure_channel
+from interlock.osdp import assessment, codec, constants, framer, lab_session, secure_channel
 from interlock.osdp.assessment import (
     _FUZZ_SCRIPT,
     STEPS,
@@ -53,8 +53,25 @@ _PD_LISTENING = "interlock-lab: PD listening on 0.0.0.0:10000"
 _PD_REJECTED = "pd-1  | OSDP: PD: Invalid CRC 0x1234; expected 0x5678\n"
 _PD_LOG = f"pd-1  | {_PD_LISTENING}\n{_PD_REJECTED}"
 
-# The healthy-lab log per service; tests override single services.
-_LOGS = {"cp": _CP_LOG, "pd": _PD_LOG}
+_CP_AUTHORISED = "interlock-lab: CP authorised unlock on card read"
+_RMAC_I_REJECTED = "osdp: CP: Out of order REPLY_RMAC_I"
+_UNLOCKED = "interlock-lab: LOCK state=UNLOCKED"
+
+# The healthy-lab log per service; tests override single services. The cp log carries one
+# genuine authorisation, the CVE step's baseline.
+_LOGS = {"cp": f"{_CP_LOG}cp-1  | {_CP_AUTHORISED}\n", "pd": _PD_LOG}
+
+_SPOOF_TRIGGER = "/tmp/interlock-spoof-fire"
+_REPLAY_TRIGGER = "/tmp/interlock-replay-fire"
+_CVE_TRIGGER = "/tmp/interlock-cve-fire"
+
+# What each trigger file adds to the logs once touched, on a healthy lab: both relays unlock
+# the clear-text PD, and the fixed CP rejects the replayed REPLY_RMAC_I.
+_TOUCH_LOGS = {
+    _SPOOF_TRIGGER: {"pd": f"pd-1  | {_UNLOCKED}\n"},
+    _REPLAY_TRIGGER: {"pd": f"pd-1  | {_UNLOCKED}\n"},
+    _CVE_TRIGGER: {"cp": f"cp-1  | {_RMAC_I_REJECTED}\n"},
+}
 
 # The in-container fuzz sweep on a healthy PD: no finding, completion reported.
 _FUZZ_CLEAN = "INTERLOCK-FUZZ-DONE 0\n"
@@ -104,7 +121,9 @@ class FakeCompose:
     per service; ``bring_up_captures`` replaces the capture pair of a bring-up, keyed by
     (LAB_SCENARIO, last override); ``captures`` overrides single basenames of the
     sniff-enumerate bring-up (b"" simulates an empty capture); ``fuzz_stdout`` and
-    ``fuzz_returncode`` script the in-container fuzz sweep.
+    ``fuzz_returncode`` script the in-container fuzz sweep. The logs are stateful: once a
+    trigger file is touched, ``touch_logs[path]`` is appended per service until the next
+    ``up`` (a fresh stack); ``touch_returncode`` is the exit code of every touch.
     """
 
     def __init__(
@@ -116,6 +135,8 @@ class FakeCompose:
         bring_up_captures: Mapping[tuple[str, str], Mapping[str, bytes]] | None = None,
         fuzz_stdout: str = _FUZZ_CLEAN,
         fuzz_returncode: int = 0,
+        touch_logs: Mapping[str, Mapping[str, str]] | None = None,
+        touch_returncode: int = 0,
     ) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.returncodes = dict(returncodes or {})
@@ -126,6 +147,10 @@ class FakeCompose:
         self.captures.update(captures or {})
         self.fuzz_stdout = fuzz_stdout
         self.fuzz_returncode = fuzz_returncode
+        self.touch_logs = {**_TOUCH_LOGS, **(touch_logs or {})}
+        self.touch_returncode = touch_returncode
+        self.touched: list[str] = []  # since the last ``up``
+        self.touches: list[str] = []  # over the whole run
 
     @property
     def captures(self) -> dict[str, bytes]:
@@ -143,8 +168,20 @@ class FakeCompose:
         self.calls.append((argv, dict(env)))
         sub = _subcommand(argv)
         returncode = self.returncodes.get(sub, 0)
-        if sub == "logs":
-            stdout = self.logs.get(argv[-1], "")
+        if sub == "up":
+            self.touched = []
+            stdout = ""
+        elif sub == "logs":
+            service = argv[-1]
+            stdout = self.logs.get(service, "") + "".join(
+                self.touch_logs.get(path, {}).get(service, "") for path in self.touched
+            )
+        elif sub == "exec" and "touch" in argv:
+            returncode = self.touch_returncode
+            if returncode == 0:
+                self.touched.append(argv[-1])
+                self.touches.append(argv[-1])
+            stdout = ""
         elif sub == "exec" and _FUZZ_SCRIPT in argv:
             stdout, returncode = self.fuzz_stdout, self.fuzz_returncode
         elif sub == "exec":
@@ -202,6 +239,9 @@ _HEALTHY_LAB_STATUSES = {
     "fuzz": "not_vulnerable",
     "weak-key-keyset": "vulnerable",
     "downgrade": "vulnerable",
+    "spoof": "vulnerable",
+    "replay": "vulnerable",
+    "cve-2024-52288-fixed": "not_vulnerable",
 }
 _HEALTHY_LAB_BRING_UPS = [
     ("cleartext", (_TAP,)),
@@ -209,6 +249,9 @@ _HEALTHY_LAB_BRING_UPS = [
     ("sc-scbkd", (_TAP,)),
     ("downgrade", (_TAP,)),
     ("downgrade", (_DOWNGRADE,)),
+    ("cleartext", ("docker-compose.spoof.yml",)),
+    ("cleartext", ("docker-compose.replay.yml",)),
+    ("sc-scbkd", ("docker-compose.cve.yml",)),
 ]
 
 
@@ -750,8 +793,6 @@ def test_weak_key_keyset_with_an_empty_capture_is_inconclusive(
 def test_weak_key_keyset_decodes_up_to_400_frames(
     lab_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from interlock.osdp import assessment
-
     seen: list[int] = []
     real = assessment.decode_chunks
 
@@ -849,3 +890,211 @@ def test_the_pdcap_free_baseline_is_still_secure() -> None:
         for raw in framer.iter_frames(data)
     ]
     assert secure_channel.detect_state(frames).secure
+
+
+# ---------------------------------------------------------------------------------------------
+# The active relay steps: spoof, clear-text replay from the live capture, CVE-2024-52288 on the
+# fixed core. Logs change only after the fake records the touch of the step's trigger file.
+
+
+def _cleartext_frames() -> list[tuple[Direction, codec.OsdpFrame]]:
+    pair = _fixture_pair("cleartext")
+    return assessment.decode_chunks(
+        [(Direction.cp_to_pd, pair["cp2pd.cap"]), (Direction.pd_to_cp, pair["pd2cp.cap"])]
+    )
+
+
+def _seed(frames: object) -> Step:
+    """A synthetic first step that leaves ``frames`` where sniff-enumerate leaves its capture."""
+
+    def seed(session: LabSession, context: dict[str, object]) -> StepOutput:
+        context["cleartext_frames"] = frames
+        return StepOutput(findings=())
+
+    return _step("seed", seed)
+
+
+def _run_after_seed(lab_dir: Path, fake: FakeCompose, frames: object, key: str) -> StepResult:
+    clock = FakeClock()
+    session = LabSession(lab_dir, runner=fake, sleep=clock.sleep, clock=clock)
+    results = run_assessment(session, steps=(_seed(frames), *_steps(key)), clock=clock)
+    return results[1]
+
+
+def _touch_argv(lab_dir: Path, override: str, path: str) -> list[str]:
+    return [*_base(lab_dir, override), "exec", "-T", "attacker", "touch", path]
+
+
+def test_spoof_unlock_after_arming_is_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose()
+    [result] = _run_steps(lab_dir, fake, "spoof")
+    assert result.status is Status.VULNERABLE
+    assert _finding_ids(result) == {"ATK-08-spoof-unlock"}
+    assert _bring_ups(fake) == [("cleartext", ("docker-compose.spoof.yml",))]
+    assert _touch_argv(lab_dir, "docker-compose.spoof.yml", _SPOOF_TRIGGER) in fake.argvs
+    assert fake.touches == [_SPOOF_TRIGGER]
+    assert fake.argvs[-1] == [*_base(lab_dir, "docker-compose.spoof.yml"), "down", "-v"]
+
+
+def test_spoof_with_the_pd_already_unlocked_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(logs={"pd": f"{_PD_LOG}pd-1  | {_UNLOCKED}\n"})
+    [result] = _run_steps(lab_dir, fake, "spoof")
+    assert result.status is Status.INCONCLUSIVE
+    assert "already unlocked" in result.detail
+    assert fake.touches == []
+
+
+def test_spoof_trigger_failing_is_an_error(lab_dir: Path) -> None:
+    fake = FakeCompose(touch_returncode=1)
+    [result] = _run_steps(lab_dir, fake, "spoof")
+    assert result.status is Status.ERROR
+    assert result.detail.startswith("LabError: ")
+    assert _SPOOF_TRIGGER in result.detail
+    assert fake.argvs[-1][-2:] == ["down", "-v"]
+
+
+def test_spoof_without_a_lock_transition_is_not_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose(touch_logs={_SPOOF_TRIGGER: {}})
+    [result] = _run_steps(lab_dir, fake, "spoof")
+    assert result.status is Status.NOT_VULNERABLE
+    assert result.detail == "armed; no lock-state transition within 120 s"
+    assert fake.touches == [_SPOOF_TRIGGER]
+
+
+def test_replay_of_the_live_card_read_is_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose()
+    result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
+    assert result.status is Status.VULNERABLE
+    assert _finding_ids(result) == {"ATK-05a-replay-card-exchange"}
+    assert _bring_ups(fake) == [("cleartext", ("docker-compose.replay.yml",))]
+    assert _touch_argv(lab_dir, "docker-compose.replay.yml", _REPLAY_TRIGGER) in fake.argvs
+    assert fake.touches == [_REPLAY_TRIGGER]
+
+
+def test_replay_without_the_sniff_capture_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose()
+    [result] = _run_steps(lab_dir, fake, "replay")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "no live clear-text capture from the sniff-enumerate step"
+    assert fake.touches == []
+
+
+def test_replay_without_a_captured_card_read_is_inconclusive(lab_dir: Path) -> None:
+    frames = [
+        (direction, frame)
+        for direction, frame in _cleartext_frames()
+        if frame.code != constants.REPLY_RAW
+    ]
+    fake = FakeCompose()
+    result = _run_after_seed(lab_dir, fake, frames, "replay")
+    assert result.status is Status.INCONCLUSIVE
+    assert "REPLY_RAW" in result.detail
+    assert fake.touches == []
+
+
+def test_replay_with_the_pd_already_unlocked_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(logs={"pd": f"{_PD_LOG}pd-1  | {_UNLOCKED}\n"})
+    result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
+    assert result.status is Status.INCONCLUSIVE
+    assert "already unlocked" in result.detail
+    assert fake.touches == []
+
+
+def test_replay_after_sniff_enumerate_uses_its_live_capture(lab_dir: Path) -> None:
+    fake = FakeCompose()
+    results = _run_steps(lab_dir, fake, "sniff-enumerate", "replay")
+    assert [r.status for r in results] == [Status.VULNERABLE, Status.VULNERABLE]
+    assert _finding_ids(results[1]) == {"ATK-05a-replay-card-exchange"}
+
+
+def test_cve_fixed_core_rejecting_the_replayed_rmac_i_is_not_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose()
+    [result] = _run_steps(lab_dir, fake, "cve-2024-52288-fixed")
+    assert result.status is Status.NOT_VULNERABLE
+    assert _RMAC_I_REJECTED in result.detail
+    assert result.detail.startswith("fixed LibOSDP 3.0.8 rejected the replayed REPLY_RMAC_I")
+    assert _bring_ups(fake) == [("sc-scbkd", ("docker-compose.cve.yml",))]
+    assert fake.touches == [_CVE_TRIGGER]
+    assert _touch_argv(lab_dir, "docker-compose.cve.yml", _CVE_TRIGGER) in fake.argvs
+
+
+def test_cve_fixed_core_re_authorising_is_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose(touch_logs={_CVE_TRIGGER: {"cp": f"cp-1  | {_CP_AUTHORISED}\n"}})
+    [result] = _run_steps(lab_dir, fake, "cve-2024-52288-fixed")
+    assert result.status is Status.VULNERABLE
+    assert _finding_ids(result) == {"ATK-05b-cve-2024-52288-rmac-replay"}
+    assert fake.touches == [_CVE_TRIGGER]
+
+
+def test_cve_with_neither_rejection_nor_re_authorisation_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(touch_logs={_CVE_TRIGGER: {}})
+    [result] = _run_steps(lab_dir, fake, "cve-2024-52288-fixed")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail == "the replay never reached the REPLY_RMAC_I fix path"
+    assert fake.touches == [_CVE_TRIGGER]
+
+
+def test_cve_without_a_baseline_authorisation_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(logs={"cp": _CP_LOG})
+    [result] = _run_steps(lab_dir, fake, "cve-2024-52288-fixed")
+    assert result.status is Status.INCONCLUSIVE
+    assert "no genuine baseline authorisation" in result.detail
+    assert fake.touches == []
+
+
+def test_cve_arm_token_issues_exactly_one_inject() -> None:
+    assert getattr(assessment, "_ARM_TOKEN", None) == b"arm-inline-relay"
+
+
+# ---------------------------------------------------------------------------------------------
+# The full default set (D-03) and the source guards.
+
+
+def test_steps_run_every_deterministic_attack_in_a_fixed_order() -> None:
+    assert [step.key for step in STEPS] == [
+        "sniff-enumerate",
+        "fuzz",
+        "weak-key-keyset",
+        "downgrade",
+        "spoof",
+        "replay",
+        "cve-2024-52288-fixed",
+    ]
+
+
+def test_no_step_uses_the_pinned_vulnerable_cve_lab() -> None:
+    for step in STEPS:
+        assert step.profile != "cve-replay", step.key
+        assert "docker-compose.vuln.yml" not in step.overrides, step.key
+    assert "docker-compose.vuln.yml" not in required_files()
+
+
+def test_replay_method_discloses_what_ran_live() -> None:
+    [replay] = _steps("replay")
+    assert "relay" in replay.method
+    assert "byte-exact" in replay.method
+    assert "host unit tests" in replay.method
+
+
+_FORBIDDEN_IMPORT_PARTS = ("safety", "serial", "open_serial_endpoint", "open_physical_endpoint")
+
+
+def test_assessment_reads_no_fixture_and_imports_nothing_physical() -> None:
+    assert assessment.__file__ is not None
+    source = Path(assessment.__file__).read_text(encoding="utf-8")
+    # Every finding comes from a live capture: no path to the committed test captures.
+    assert "osdp/fixtures" not in source
+    assert "FIXTURES_DIR" not in source
+    assert '.cap"' not in source
+    imported: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            imported.append(module)
+            imported += [f"{module}.{alias.name}" for alias in node.names]
+    assert imported, "the scan found no imports at all"
+    for name in imported:
+        assert not any(part in name for part in _FORBIDDEN_IMPORT_PARTS), name
+        assert name != "tests" and not name.startswith("tests."), name
