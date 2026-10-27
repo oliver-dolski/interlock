@@ -30,6 +30,10 @@ interlock = "interlock.cli:app"
 [project.entry-points."interlock.plugins"]
 demo = "interlock.plugins.demo:DemoPlugin"
 
+# A plugin's CLI command group is discovered from this group (D-04).
+[project.entry-points."interlock.commands"]
+osdp = "interlock.osdp.attacks:build_osdp_app"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/interlock"]
 
