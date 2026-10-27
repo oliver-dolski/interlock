@@ -109,6 +109,39 @@ _BRING_UP_CAPTURES = {
     ("downgrade", _DOWNGRADE): _fixture_pair("cleartext"),
 }
 
+# What ``docker compose config --format json`` resolves for a contained lab: a synthetic dict
+# of the probed shape (relative bind source, never a host path). It already satisfies every
+# containment rule: one internal network, no published or exposed port, no device, no
+# privilege or namespace key, a read-only bind and the cp pinned to the attacker.
+_CLEAN_CONFIG: dict[str, object] = {
+    "name": "interlock-assess",
+    "networks": {"labnet": {"name": "interlock-assess_labnet", "internal": True}},
+    "services": {
+        "pd": {"networks": {"labnet": None}, "environment": {"LAB_SCENARIO": "cleartext"}},
+        "attacker": {
+            "networks": {"labnet": None},
+            "environment": {"ATTACKER_UPSTREAM": "pd:10000", "PYTHONPATH": "/app/src"},
+            "volumes": [
+                {"type": "bind", "source": "./src", "target": "/app/src", "read_only": True}
+            ],
+        },
+        "cp": {
+            "networks": {"labnet": None},
+            "environment": {"LAB_SCENARIO": "cleartext", "CP_UPSTREAM": "attacker:10000"},
+        },
+    },
+}
+
+
+def _planted(service: str, key: str, value: object) -> dict[str, object]:
+    """Return a deep copy of ``_CLEAN_CONFIG`` with ``key: value`` set on one service."""
+    config: dict[str, object] = json.loads(json.dumps(_CLEAN_CONFIG))
+    services = config["services"]
+    assert isinstance(services, dict)
+    services[service][key] = value
+    return config
+
+
 # Flags of the base ``docker compose`` argv that take a value before the subcommand.
 _VALUE_FLAGS = {"-p", "-f"}
 
@@ -136,6 +169,8 @@ class FakeCompose:
     ``fuzz_returncode`` script the in-container fuzz sweep. The logs are stateful: once a
     trigger file is touched, ``touch_logs[path]`` is appended per service until the next
     ``up`` (a fresh stack); ``touch_returncode`` is the exit code of every touch.
+    ``config`` answers with ``_CLEAN_CONFIG`` as JSON unless ``configs`` holds a document for
+    the argv's last override ("" for the base file alone), which plants a violation.
     """
 
     def __init__(
@@ -150,8 +185,10 @@ class FakeCompose:
         fuzz_returncode: int = 0,
         touch_logs: Mapping[str, Mapping[str, str]] | None = None,
         touch_returncode: int = 0,
+        configs: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
+        self.configs = dict(configs or {})
         self.returncodes = dict(returncodes or {})
         self.logs = {**_LOGS, **(logs or {})}
         self.bring_up_captures = {
@@ -185,6 +222,9 @@ class FakeCompose:
         if sub == "up":
             self.touched = []
             stdout = ""
+        elif sub == "config":
+            overrides = _overrides(argv)
+            stdout = json.dumps(self.configs.get(overrides[-1] if overrides else "", _CLEAN_CONFIG))
         elif sub == "logs":
             service = argv[-1]
             overrides = _overrides(argv)
@@ -301,13 +341,23 @@ def test_assess_runs_every_step_end_to_end(
     statuses = {step["key"]: step["status"] for step in document["steps"]}
     assert statuses == _HEALTHY_LAB_STATUSES
 
-    # Reset first, then every bring-up in step order, each torn down before the next.
+    # The containment check of base + each override first (one bring-up layers exactly one
+    # override), then the reset, then every bring-up in step order, each torn down before the
+    # next.
+    configs = [
+        [*_base(lab_dir, override), "config", "--format", "json"]
+        for override in required_files()[1:]
+    ]
+    checked = len(configs)
+    assert fake.argvs[:checked] == configs
     tap = _base(lab_dir, "docker-compose.tap.yml")
-    assert fake.argvs[0] == [*_base(lab_dir), "down", "-v"]
-    assert fake.argvs[1] == [*tap, "up", "-d", "--build", "--force-recreate"]
-    assert fake.calls[1][1]["LAB_SCENARIO"] == "cleartext"
+    assert fake.argvs[checked] == [*_base(lab_dir), "down", "-v"]
+    assert fake.argvs[checked + 1] == [*tap, "up", "-d", "--build", "--force-recreate"]
+    assert fake.calls[checked + 1][1]["LAB_SCENARIO"] == "cleartext"
     assert _bring_ups(fake) == _HEALTHY_LAB_BRING_UPS
-    ups_and_downs = [argv for argv in fake.argvs[1:] if _subcommand(argv) in {"up", "down"}]
+    ups_and_downs = [
+        argv for argv in fake.argvs[checked + 1 :] if _subcommand(argv) in {"up", "down"}
+    ]
     for up, down in zip(ups_and_downs[::2], ups_and_downs[1::2], strict=True):
         assert up[-4:] == ["up", "-d", "--build", "--force-recreate"]
         assert down == [*up[:-4], "down", "-v"]
@@ -370,6 +420,41 @@ def test_preflight_no_lab_dir_found_exits_2_without_reports(
     assert result.exit_code == 2, result.output
     assert "--lab-dir" in result.stderr
     _assert_nothing_written(tmp_path, fake)
+
+
+def test_preflight_containment_violation_exits_2_without_reports(
+    tmp_path: Path, lab_dir: Path, fake: FakeCompose
+) -> None:
+    fake.configs["docker-compose.spoof.yml"] = _planted("pd", "ports", ["8000:10000"])
+    md_path = tmp_path / "out" / "assessment.md"
+    result = runner.invoke(app, ["osdp", "assess", "-o", str(md_path), "--lab-dir", str(lab_dir)])
+    assert result.exit_code == 2, result.output
+    assert "docker-compose.spoof.yml" in result.stderr
+    assert "pd" in result.stderr and "ports" in result.stderr
+    assert not (tmp_path / "out").exists()
+    # The check runs before anything is brought up, and only config calls were made.
+    assert fake.calls, "the containment check never ran"
+    assert {_subcommand(argv) for argv in fake.argvs} == {"config"}
+
+
+def test_report_scope_names_the_containment_check(
+    tmp_path: Path, lab_dir: Path, fake: FakeCompose
+) -> None:
+    md_path = tmp_path / "out" / "assessment.md"
+    result = runner.invoke(app, ["osdp", "assess", "-o", str(md_path), "--lab-dir", str(lab_dir)])
+    assert result.exit_code == 0, result.output
+
+    markdown = md_path.read_text(encoding="utf-8")
+    scope = _section(markdown, "Scope")
+    [bullet] = [line for line in scope if line.startswith("- **Containment:** ")]
+    assert "checked before the run" in bullet
+    assert "every network internal" in bullet and "no published ports" in bullet
+    assert str(lab_dir) not in "\n".join(scope)
+
+    document = json.loads(md_path.with_suffix(".json").read_text(encoding="utf-8"))
+    containment = document["containment"]
+    assert containment["checked"] is True
+    assert bullet == f"- **Containment:** {containment['detail']}."
 
 
 def test_preflight_json_output_path_exits_2_without_reports(
@@ -1574,7 +1659,11 @@ def test_full_report_reads_as_an_attack_mapped_assessment(tmp_path: Path, lab_di
     assert positions == sorted(positions)
 
     scope = "\n".join(_section(markdown, "Scope"))
-    assert "network-isolated lab" in scope
+    # write_reports was handed no containment result, so the report claims none.
+    assert "network-isolated" not in scope
+    assert "- **Target:** the bundled lab, compose project interlock-assess." in scope
+    assert "- **Containment:** not checked by this run." in scope
+    assert document["containment"] == {"checked": False, "detail": "not checked by this run"}
     assert "interlock-assess" in scope
     assert "cleartext, sc-scbkd, downgrade" in scope
     assert "LibOSDP 3.0.8 (fixed)" in scope
