@@ -17,7 +17,7 @@ import json
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -801,17 +801,30 @@ def test_weak_key_keyset_with_an_empty_capture_is_inconclusive(
 def test_weak_key_keyset_decodes_up_to_400_frames(
     lab_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: list[int] = []
+    seen: list[tuple[tuple[Direction, ...], int]] = []
     real = assessment.decode_chunks
 
-    def spy(chunks: object, *, max_frames: int = 200) -> object:
-        seen.append(max_frames)
-        return real(chunks, max_frames=max_frames)  # type: ignore[arg-type]
+    def spy(chunks: Iterable[tuple[Direction, bytes]], *, max_frames: int = 200) -> object:
+        chunks = list(chunks)
+        seen.append((tuple(direction for direction, _ in chunks), max_frames))
+        return real(chunks, max_frames=max_frames)
 
     monkeypatch.setattr(assessment, "decode_chunks", spy)
     [result] = _run_steps(lab_dir, FakeCompose(), "weak-key-keyset")
     assert result.status is Status.VULNERABLE
-    assert seen == [400]
+    # One call per direction, each under its own cap: a long cp->pd never starves pd->cp.
+    assert seen == [((Direction.cp_to_pd,), 400), ((Direction.pd_to_cp,), 400)]
+
+
+def test_weak_key_keyset_with_cp_to_pd_past_the_cap_still_sees_the_pd_handshake(
+    lab_dir: Path,
+) -> None:
+    pair = _fixture_pair("keyset")
+    pair["cp2pd.cap"] = _with_trailing(pair["cp2pd.cap"], constants.CMD_POLL, _PAST_WEAK_KEY_CAP)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert {"ATK-06-weak-key", "ATK-04-keyset"} <= _finding_ids(result)
 
 
 def test_downgrade_pair_forced_to_clear_text_is_vulnerable(lab_dir: Path) -> None:
@@ -868,6 +881,24 @@ def _without_pdcap(capture: bytes) -> bytes:
         raw for raw in framer.iter_frames(capture)
         if codec.decode(raw).code != constants.REPLY_PDCAP
     )
+
+
+# Trailing frame counts past each frame cap: the default 200, and weak-key-keyset's 400.
+_PAST_SNIFF_CAP = 250
+_PAST_WEAK_KEY_CAP = 450
+
+
+def _with_trailing(capture: bytes, code: int, count: int) -> bytes:
+    """Return ``capture`` followed by ``count`` copies of its first frame with ``code``.
+
+    Models a bus that keeps polling until the capture is read: the session stays at the head
+    and the tail grows with every exchange.
+    """
+    raw = next(
+        (raw for raw in framer.iter_frames(capture) if codec.decode(raw).code == code), None
+    )
+    assert raw is not None, f"no frame with code {code:#04x} in the capture"
+    return capture + raw * count
 
 
 def test_downgrade_with_no_communication_security_advertised_is_inconclusive(
