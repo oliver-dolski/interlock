@@ -1175,6 +1175,15 @@ def test_downgrade_refusal_with_an_empty_relay_capture_is_inconclusive(lab_dir: 
     assert "pd->cp capture is empty" in result.detail
 
 
+def test_downgrade_refusal_with_a_capped_relay_capture_is_inconclusive(lab_dir: Path) -> None:
+    # Every decoded REPLY_PDCAP is stripped, but an unstripped one may lie past the cap.
+    fake = _enforcing_cp(_with_trailing(_stripped_pd2cp(), constants.REPLY_ACK, _PAST_SNIFF_CAP))
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail.startswith(_NOT_ONLINE)
+    assert "200-frame cap" in result.detail
+
+
 def test_downgrade_with_no_communication_security_advertised_is_inconclusive(
     lab_dir: Path,
 ) -> None:

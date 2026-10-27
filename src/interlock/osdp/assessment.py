@@ -40,7 +40,7 @@ from rich.table import Table
 
 import interlock
 from interlock import report
-from interlock.osdp import attack_map, lab_session, secure_channel
+from interlock.osdp import attack_map, constants, lab_session, secure_channel
 from interlock.osdp.attacks import downgrade, replay, spoof
 from interlock.osdp.attacks.enumerate import run_enumerate
 from interlock.osdp.attacks.fuzz import LIBOSDP_REJECTION_MARKERS
@@ -60,6 +60,12 @@ PD_ONLINE = "interlock-lab: PD 101 online"
 EVENT_RECEIVED = "interlock-lab: event received"
 _PD_ONLINE_TIMEOUT = 180.0
 _EVENT_TIMEOUT = 90.0
+
+# The CP's own refusal of a PD that no longer advertises Secure Channel while the CP enforces it
+# (LibOSDP 3.0.8 osdp_cp.c, state OSDP_CP_STATE_CAPDET, LOG_INF "SC disabled/incapable; Set PD
+# offline due to ENFORCE_SECURE"). No bundled lab profile enforces Secure Channel, so the path
+# that reads it is proven by host tests only.
+SC_ENFORCED_REFUSAL = "Set PD offline due to ENFORCE_SECURE"
 
 # pd log sentinel printed once the lab PD is about to accept() (the fuzz override idles the CP).
 PD_LISTENING = "interlock-lab: PD listening on 0.0.0.0:10000"
@@ -208,17 +214,21 @@ def _decode_direction(direction: Direction, data: bytes, *, max_frames: int) -> 
     return frames
 
 
-def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> _Capture:
-    """Gate on a full session, read both per-direction captures and decode them.
+def _require_session(lab: lab_session.LabHandle) -> None:
+    """Raise ``Inconclusive`` unless the cp log shows PD 101 online and a card-read event."""
+    _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
+    _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
+
+
+def _read_capture(lab: lab_session.LabHandle, *, max_frames: int = 200) -> _Capture:
+    """Read both per-direction captures and decode them.
 
     Each direction is decoded under its own ``max_frames`` cap, so a long cp->pd capture (the
     CP polls until the capture is read) can never starve the pd->cp half. Returns a
     ``_Capture`` with the frames, cp->pd first, the captured byte count and the directions that
-    reached the cap. Raises ``Inconclusive`` when the PD never came online, no card-read event
-    was seen, or a capture is empty or decodes to no OSDP frame.
+    reached the cap. Raises ``Inconclusive`` when a capture is empty or decodes to no OSDP
+    frame.
     """
-    _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
-    _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
     cp2pd = lab.read_capture(CP2PD_PATH.as_posix())
     pd2cp = lab.read_capture(PD2CP_PATH.as_posix())
     if not cp2pd:
@@ -239,6 +249,16 @@ def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> _C
             if len(frames) >= max_frames
         ),
     )
+
+
+def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> _Capture:
+    """Gate on a full session, then read and decode both captures (``_read_capture``).
+
+    Raises ``Inconclusive`` when the PD never came online, no card-read event was seen, or a
+    capture is empty or decodes to no OSDP frame.
+    """
+    _require_session(lab)
+    return _read_capture(lab, max_frames=max_frames)
 
 
 def _sniff_enumerate(session: LabSession, context: dict[str, object]) -> StepOutput:
@@ -391,7 +411,10 @@ def _downgrade(session: LabSession, context: dict[str, object]) -> StepOutput:
         raise Inconclusive("baseline advertised no CommunicationSecurity to strip")
 
     with session.scenario(_DOWNGRADE_PROFILE, _DOWNGRADE_ATTACKED) as lab:
-        attacked = _capture_session(lab).frames
+        if not lab.wait_for_log("cp", PD_ONLINE, timeout=_PD_ONLINE_TIMEOUT):
+            return _enforced_refusal(lab)
+        _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
+        attacked = _read_capture(lab).frames
     findings = downgrade.run_downgrade(baseline, attacked)
     if findings:
         return StepOutput(
@@ -407,6 +430,54 @@ def _downgrade(session: LabSession, context: dict[str, object]) -> StepOutput:
             ),
         )
     raise Inconclusive("the downgrade verdict found no proof either way")
+
+
+def _enforced_refusal(lab: lab_session.LabHandle) -> StepOutput:
+    """Prove that the attacked CP refused the stripped PD, or raise ``Inconclusive``.
+
+    Called when PD 101 never came online through the stripping relay. Only the CP's own
+    ENFORCE_SECURE refusal line together with a relayed REPLY_PDCAP that no longer advertises
+    CommunicationSecurity proves the refusal; a refusal of an unstripped PD proves nothing
+    about the downgrade. Anything short of both, including an empty, undecodable or capped
+    relay capture, is inconclusive.
+    """
+    missing = f"PD 101 online not observed in the cp log within {_PD_ONLINE_TIMEOUT:.0f} s"
+    refusal = next(
+        (line for line in lab.logs("cp").splitlines() if SC_ENFORCED_REFUSAL in line), None
+    )
+    if refusal is None:
+        raise Inconclusive(f"{missing}, and the cp log carries no ENFORCE_SECURE refusal")
+    logged = f"{missing}; the CP logged its ENFORCE_SECURE refusal, but"
+    pd2cp = lab.read_capture(PD2CP_PATH.as_posix())
+    if not pd2cp:
+        raise Inconclusive(f"{logged} the relay's pd->cp capture is empty")
+    cap = 200  # the downgrade step's frame cap, as for its other captures
+    try:
+        frames = _decode_direction(Direction.pd_to_cp, pd2cp, max_frames=cap)
+    except Inconclusive:
+        raise Inconclusive(
+            f"{logged} the relay's pd->cp capture decoded to no OSDP frame"
+        ) from None
+    if len(frames) >= cap:
+        raise Inconclusive(
+            f"{logged} decoding the relay's pd->cp capture stopped at the {cap}-frame cap, so "
+            "an unstripped REPLY_PDCAP may lie past it"
+        )
+    pdcaps = [frame for _, frame in frames if frame.code == constants.REPLY_PDCAP]
+    if not pdcaps:
+        raise Inconclusive(f"{logged} the relay's pd->cp capture holds no REPLY_PDCAP")
+    if downgrade._advertises_communication_security(frames):
+        raise Inconclusive(
+            f"{logged} a relayed REPLY_PDCAP still advertised CommunicationSecurity, so the "
+            "relay never stripped what the CP refused"
+        )
+    return StepOutput(
+        findings=(),
+        detail=(
+            f'the CP refused the stripped PD (Secure Channel enforced): "{refusal.strip()}"; '
+            f"{len(pdcaps)} relayed REPLY_PDCAP frame(s) carried no CommunicationSecurity"
+        ),
+    )
 
 
 # The single lock-state sentinel the lab PD prints (lab/osdp/pd_driver.py), and its wait.
@@ -630,7 +701,9 @@ STEPS: tuple[Step, ...] = (
         run=_downgrade,
         method=(
             "before/after pair: untouched session via the tap, then the inline relay stripping "
-            "CommunicationSecurity from REPLY_PDCAP"
+            "CommunicationSecurity from REPLY_PDCAP; a CP that refuses the stripped PD (its own "
+            "ENFORCE_SECURE line plus a relayed REPLY_PDCAP without CommunicationSecurity) is "
+            "not_vulnerable"
         ),
         clean_detail="The attacked session stayed Secure Channel.",
         attacks=(("downgrade", "ATK-03-"),),
