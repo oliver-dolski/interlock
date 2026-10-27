@@ -1,0 +1,24 @@
+interlock
+Copyright 2026 Oliver Dolski
+
+This product includes technique identifiers and names from MITRE ATT&CK® Enterprise and
+MITRE ATT&CK® for ICS, version 20.0, in src/interlock/osdp/attack_map.py.
+
+© 2026 The MITRE Corporation. This work is reproduced and distributed with the permission of The MITRE Corporation.
+
+Licensed under the MITRE ATT&CK Terms of Use:
+
+"The MITRE Corporation (MITRE) hereby grants you a non-exclusive, royalty-free license to use ATT&CK® for research, development, and commercial purposes. Any copy you make for such purposes is authorized provided that you reproduce MITRE's copyright designation and this license in any such copy."
+
+MITRE ATT&CK and ATT&CK are registered trademarks of The MITRE Corporation.
+Terms of Use: https://attack.mitre.org/resources/legal-and-branding/terms-of-use/
+
+interlock is an independent project and is not affiliated with The MITRE Corporation.
+
+Third-party code
+================
+
+No third-party code is redistributed in this repository or its packages. The lab images build
+LibOSDP (Apache-2.0, https://github.com/osdp-dev/libosdp) from source at image build time:
+version 3.0.8 from PyPI (Dockerfile) and tag v2.4.0 from git for the opt-in vulnerable profile
+(Dockerfile.vuln). Neither is vendored.
