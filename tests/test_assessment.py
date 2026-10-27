@@ -48,6 +48,7 @@ from interlock.osdp.assessment import (
     run_assessment,
     write_reports,
 )
+from interlock.osdp.attacks import downgrade
 from interlock.osdp.lab_session import LabSession
 from interlock.osdp.transport import Direction
 from interlock.plugin import Finding, Severity, finding_to_dict
@@ -127,7 +128,9 @@ class FakeCompose:
     """A recording ``Runner`` that simulates the lab per compose subcommand.
 
     ``returncodes`` overrides the exit code per subcommand; ``logs`` overrides the log text
-    per service; ``bring_up_captures`` replaces the capture pair of a bring-up, keyed by
+    per service; ``bring_up_logs`` replaces that per-service log text for one bring-up only,
+    keyed like ``bring_up_captures`` by (LAB_SCENARIO, last override, "" when none);
+    ``bring_up_captures`` replaces the capture pair of a bring-up, keyed by
     (LAB_SCENARIO, last override); ``captures`` overrides single basenames of the
     sniff-enumerate bring-up (b"" simulates an empty capture); ``fuzz_stdout`` and
     ``fuzz_returncode`` script the in-container fuzz sweep. The logs are stateful: once a
@@ -142,6 +145,7 @@ class FakeCompose:
         logs: Mapping[str, str] | None = None,
         captures: Mapping[str, bytes] | None = None,
         bring_up_captures: Mapping[tuple[str, str], Mapping[str, bytes]] | None = None,
+        bring_up_logs: Mapping[tuple[str, str], Mapping[str, str]] | None = None,
         fuzz_stdout: str = _FUZZ_CLEAN,
         fuzz_returncode: int = 0,
         touch_logs: Mapping[str, Mapping[str, str]] | None = None,
@@ -154,6 +158,7 @@ class FakeCompose:
             key: dict(pair) for key, pair in {**_BRING_UP_CAPTURES, **(bring_up_captures or {})}.items()
         }
         self.captures.update(captures or {})
+        self.bring_up_logs = {key: dict(logs) for key, logs in (bring_up_logs or {}).items()}
         self.fuzz_stdout = fuzz_stdout
         self.fuzz_returncode = fuzz_returncode
         self.touch_logs = {**_TOUCH_LOGS, **(touch_logs or {})}
@@ -182,7 +187,10 @@ class FakeCompose:
             stdout = ""
         elif sub == "logs":
             service = argv[-1]
-            stdout = self.logs.get(service, "") + "".join(
+            overrides = _overrides(argv)
+            key = (env["LAB_SCENARIO"], overrides[-1] if overrides else "")
+            logs = {**self.logs, **self.bring_up_logs.get(key, {})}
+            stdout = logs.get(service, "") + "".join(
                 self.touch_logs.get(path, {}).get(service, "") for path in self.touched
             )
         elif sub == "exec" and "touch" in argv:
@@ -1089,6 +1097,82 @@ def _without_ccrypt(capture: bytes) -> bytes:
         raw for raw in framer.iter_frames(capture)
         if codec.decode(raw).code != constants.REPLY_CCRYPT
     )
+
+
+# LibOSDP 3.0.8's CP refusing a PD that no longer advertises Secure Channel (osdp_cp.c, CAPDET).
+_ENFORCE_SECURE = "cp-1  | osdp: CP: SC disabled/incapable; Set PD offline due to ENFORCE_SECURE"
+
+
+def _enforcing_cp(relayed_pd2cp: bytes, cp_log: str = f"{_ENFORCE_SECURE}\n") -> FakeCompose:
+    """A downgrade pair whose attacked CP never brings PD 101 online.
+
+    The baseline under the tap is the healthy Secure Channel session; the attacked bring-up
+    logs ``cp_log`` instead of the online sentinels, and the relay's pd->cp capture is
+    ``relayed_pd2cp``.
+    """
+    return FakeCompose(
+        bring_up_captures={
+            ("downgrade", _TAP): _fixture_pair("downgrade"),
+            ("downgrade", _DOWNGRADE): {
+                "cp2pd.cap": _fixture_pair("downgrade")["cp2pd.cap"],
+                "pd2cp.cap": relayed_pd2cp,
+            },
+        },
+        bring_up_logs={("downgrade", _DOWNGRADE): {"cp": cp_log}},
+    )
+
+
+def _stripped_pd2cp() -> bytes:
+    """The downgrade PD's replies as the relay forwards them: CommunicationSecurity removed."""
+    return downgrade.strip_sc_capability(Direction.pd_to_cp, _fixture_pair("downgrade")["pd2cp.cap"])
+
+
+_NOT_ONLINE = "PD 101 online not observed in the cp log within 180 s"
+
+
+def test_downgrade_refused_by_an_enforcing_cp_is_not_vulnerable(lab_dir: Path) -> None:
+    fake = _enforcing_cp(_stripped_pd2cp())
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.NOT_VULNERABLE, result.detail
+    assert result.findings == ()
+    assert "refused the stripped PD" in result.detail
+    assert _ENFORCE_SECURE in result.detail
+    assert _bring_ups(fake) == [("downgrade", (_TAP,)), ("downgrade", (_DOWNGRADE,))]
+    assert fake.argvs[-1] == [*_base(lab_dir, _DOWNGRADE), "down", "-v"]
+
+
+def test_downgrade_without_the_enforce_secure_line_is_inconclusive(lab_dir: Path) -> None:
+    fake = _enforcing_cp(_stripped_pd2cp(), cp_log="cp-1  | interlock-lab: starting\n")
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail.startswith(_NOT_ONLINE)
+    assert "ENFORCE_SECURE" in result.detail
+    assert result.findings == ()
+
+
+def test_downgrade_refusal_with_an_unstripped_pdcap_is_inconclusive(lab_dir: Path) -> None:
+    # The CP refused, but the relay never stripped anything: the refusal proves nothing.
+    fake = _enforcing_cp(_fixture_pair("downgrade")["pd2cp.cap"])
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail.startswith(_NOT_ONLINE)
+    assert "still advertised CommunicationSecurity" in result.detail
+
+
+def test_downgrade_refusal_without_a_relayed_pdcap_is_inconclusive(lab_dir: Path) -> None:
+    fake = _enforcing_cp(_without_pdcap(_stripped_pd2cp()))
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail.startswith(_NOT_ONLINE)
+    assert "no REPLY_PDCAP" in result.detail
+
+
+def test_downgrade_refusal_with_an_empty_relay_capture_is_inconclusive(lab_dir: Path) -> None:
+    fake = _enforcing_cp(b"")
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.INCONCLUSIVE
+    assert result.detail.startswith(_NOT_ONLINE)
+    assert "pd->cp capture is empty" in result.detail
 
 
 def test_downgrade_with_no_communication_security_advertised_is_inconclusive(
