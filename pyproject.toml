@@ -6,8 +6,34 @@ build-backend = "hatchling.build"
 name = "interlock"
 version = "0.1.0"
 description = "Extensible red-team and security-assessment platform for OT, edge, and physical-security devices."
+readme = "README.md"
 requires-python = ">=3.11"
+# SPDX expression (PEP 639); it replaces the License trove classifier, so none is listed below.
 license = "Apache-2.0"
+authors = [{ name = "Oliver Dolski", email = "oliver.dolski1@gmail.com" }]
+keywords = [
+    "osdp",
+    "access-control",
+    "red-team",
+    "ot-security",
+    "mitre-attack",
+    "security-assessment",
+    "libosdp",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Security",
+]
 dependencies = [
     "typer>=0.12",
     "rich>=13",
@@ -23,6 +49,12 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
 ]
+
+[project.urls]
+Homepage = "https://github.com/oliver-dolski/interlock"
+Source = "https://github.com/oliver-dolski/interlock"
+Issues = "https://github.com/oliver-dolski/interlock/issues"
+Documentation = "https://github.com/oliver-dolski/interlock/blob/main/docs/plugin-authoring.md"
 
 [project.scripts]
 interlock = "interlock.cli:app"
