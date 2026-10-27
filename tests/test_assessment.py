@@ -827,6 +827,98 @@ def test_weak_key_keyset_with_cp_to_pd_past_the_cap_still_sees_the_pd_handshake(
     assert {"ATK-06-weak-key", "ATK-04-keyset"} <= _finding_ids(result)
 
 
+def test_weak_key_keyset_without_the_pd_half_of_the_handshake_is_inconclusive(
+    lab_dir: Path,
+) -> None:
+    pair = _fixture_pair("sc-scbkd")
+    pair["pd2cp.cap"] = _without_ccrypt(pair["pd2cp.cap"])
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.INCONCLUSIVE
+    assert "no REPLY_CCRYPT pd->cp captured" in result.detail
+    assert result.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("key", "bring_up", "fixture"),
+    [
+        ("sniff-enumerate", _SNIFF_BRING_UP, "cleartext"),
+        ("weak-key-keyset", ("sc-scbkd", _TAP), "sc-scbkd"),
+    ],
+    ids=["sniff-enumerate", "weak-key-keyset"],
+)
+@pytest.mark.parametrize(
+    ("basename", "label"), [("cp2pd.cap", "cp->pd"), ("pd2cp.cap", "pd->cp")], ids=["cp2pd", "pd2cp"]
+)
+def test_capture_direction_decoding_to_no_frame_is_inconclusive(
+    lab_dir: Path, key: str, bring_up: tuple[str, str], fixture: str, basename: str, label: str
+) -> None:
+    # Non-empty, but no OSDP frame in it: proves nothing, the same as an empty capture.
+    pair = {**_fixture_pair(fixture), basename: bytes(64)}
+    fake = FakeCompose(bring_up_captures={bring_up: pair})
+    [result] = _run_steps(lab_dir, fake, key)
+    assert result.status is Status.INCONCLUSIVE
+    assert "decoded to no OSDP frame" in result.detail
+    assert label in result.detail
+    assert result.findings == ()
+
+
+def test_weak_key_keyset_on_a_non_default_key_bus_is_not_vulnerable(lab_dir: Path) -> None:
+    """Guard for the fail-closed gates: a full, uncut, non-default-key handshake is clean."""
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): _fixture_pair("downgrade")})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.NOT_VULNERABLE
+    assert result.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("basename", "code", "label"),
+    [
+        ("cp2pd.cap", constants.CMD_POLL, "cp->pd"),
+        ("pd2cp.cap", constants.REPLY_ACK, "pd->cp"),
+    ],
+    ids=["cp2pd", "pd2cp"],
+)
+def test_weak_key_keyset_without_a_match_past_the_frame_cap_is_inconclusive(
+    lab_dir: Path, basename: str, code: int, label: str
+) -> None:
+    # No weak key matched, but the matching handshake may lie past the cap: not a clean result.
+    pair = _fixture_pair("downgrade")
+    pair[basename] = _with_trailing(pair[basename], code, _PAST_WEAK_KEY_CAP)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.INCONCLUSIVE
+    assert f"decoding stopped at the 400-frame cap in {label}" in result.detail
+    assert result.findings == ()
+
+
+def test_capture_detail_counts_frames_per_direction_and_names_a_reached_cap(
+    lab_dir: Path,
+) -> None:
+    pair = _fixture_pair("sc-scbkd")
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    captured = len(pair["cp2pd.cap"]) + len(pair["pd2cp.cap"])
+    assert result.detail == f"13 cp->pd and 14 pd->cp frames decoded from {captured} captured bytes"
+
+    # Findings decoded within the cap stay proof; the detail names the direction that hit it.
+    long_cp = _fixture_pair("keyset")
+    long_cp["cp2pd.cap"] = _with_trailing(long_cp["cp2pd.cap"], constants.CMD_POLL, _PAST_WEAK_KEY_CAP)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): long_cp})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert result.detail.endswith("; decoding stopped at the 400-frame cap in cp->pd")
+
+    long_both = {**long_cp}
+    long_both["pd2cp.cap"] = _with_trailing(
+        long_both["pd2cp.cap"], constants.REPLY_ACK, _PAST_WEAK_KEY_CAP
+    )
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): long_both})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert result.detail.endswith("; decoding stopped at the 400-frame cap in cp->pd and pd->cp")
+
+
 def test_downgrade_pair_forced_to_clear_text_is_vulnerable(lab_dir: Path) -> None:
     fake = FakeCompose(
         bring_up_captures={
@@ -899,6 +991,17 @@ def _with_trailing(capture: bytes, code: int, count: int) -> bytes:
     )
     assert raw is not None, f"no frame with code {code:#04x} in the capture"
     return capture + raw * count
+
+
+def _without_ccrypt(capture: bytes) -> bytes:
+    """Return a pd->cp ``capture`` with every REPLY_CCRYPT frame dropped (no PD handshake half).
+
+    0x76 is also CMD_CHLNG cp->pd, so this is only ever applied to a pd->cp capture.
+    """
+    return b"".join(
+        raw for raw in framer.iter_frames(capture)
+        if codec.decode(raw).code != constants.REPLY_CCRYPT
+    )
 
 
 def test_downgrade_with_no_communication_security_advertised_is_inconclusive(
