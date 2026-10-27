@@ -9,6 +9,9 @@ move onto the contract changes no command name, option or exit code.
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
+from dataclasses import dataclass
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,7 @@ import pytest
 import typer
 import typer.core
 import typer.main
+from typer.testing import CliRunner
 
 from interlock import cli, registry
 from interlock.cli import app
@@ -187,3 +191,157 @@ def test_osdp_group_comes_from_the_commands_entry_point(
     without = typer.main.get_command(cli.build_app())
     assert isinstance(without, typer.core.TyperGroup)
     assert sorted(without.commands) == ["plugins", "run"]
+
+
+def test_import_scan_flags_a_planted_protocol_import() -> None:
+    source = (
+        "import importlib\n"
+        "import interlock.osdp.codec\n"
+        "from interlock.osdp import assessment\n"
+        'attacks = importlib.import_module("interlock.osdp.attacks")\n'
+    )
+    assert protocol_imports(source) == [
+        "line 2: import interlock.osdp.codec",
+        "line 3: from interlock.osdp import assessment",
+        "line 4: 'interlock.osdp.attacks'",
+    ]
+
+
+def test_import_scan_passes_a_clean_core_module() -> None:
+    assert protocol_imports("import typer\nfrom interlock import registry\n") == []
+
+
+# D-04 command-group seam: a broken or hostile group never takes the core CLI down. -----------
+
+
+@dataclass(frozen=True)
+class _FakeEntryPoint:
+    """An ``interlock.commands`` entry point whose ``load()`` returns or raises ``target``."""
+
+    name: str
+    target: object
+
+    def load(self) -> object:
+        if isinstance(self.target, BaseException):
+            raise self.target
+        return self.target
+
+
+class _NeverCalledTyper(typer.Typer):
+    """A Typer that fails the test if the core calls it (calling a Typer runs the CLI)."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a Typer registered directly must be attached, never called")
+
+
+def _group(typer_class: type[typer.Typer] = typer.Typer) -> typer.Typer:
+    group = typer_class(help="A fake protocol group.")
+
+    @group.command()
+    def ping() -> None:
+        """Answer with pong."""
+        typer.echo("pong")
+
+    return group
+
+
+def _install_command_groups(
+    monkeypatch: pytest.MonkeyPatch, *fakes: _FakeEntryPoint
+) -> Callable[[], typer.Typer]:
+    """Serve ``fakes`` for the commands group and the real entry points for any other group."""
+
+    def fake_entry_points(*, group: str) -> Any:
+        if group == registry.COMMANDS_GROUP:
+            return list(fakes)
+        return entry_points(group=group)
+
+    monkeypatch.setattr(registry, "entry_points", fake_entry_points)
+    return cli.build_app
+
+
+def _commands(app: typer.Typer) -> list[str]:
+    root = typer.main.get_command(app)
+    assert isinstance(root, typer.core.TyperGroup)
+    return sorted(root.commands)
+
+
+def _boom() -> typer.Typer:
+    raise RuntimeError("factory exploded")
+
+
+def test_a_group_that_fails_to_load_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    build = _install_command_groups(
+        monkeypatch,
+        _FakeEntryPoint("broken", ImportError("No module named 'nowhere'")),
+        _FakeEntryPoint("good", _group),
+    )
+    commands = _commands(build())
+    assert commands == ["good", "plugins", "run"]
+    assert "interlock: skipping command group 'broken':" in capsys.readouterr().err
+
+
+def test_a_factory_that_raises_is_skipped_and_the_others_attach(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    build = _install_command_groups(
+        monkeypatch, _FakeEntryPoint("boom", _boom), _FakeEntryPoint("good", _group)
+    )
+    commands = _commands(build())
+    assert commands == ["good", "plugins", "run"]
+    assert "interlock: skipping command group 'boom': factory exploded" in capsys.readouterr().err
+
+
+def test_a_factory_returning_something_else_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    build = _install_command_groups(monkeypatch, _FakeEntryPoint("odd", lambda: object()))
+    assert _commands(build()) == ["plugins", "run"]
+    assert "interlock: skipping command group 'odd': not a typer.Typer" in capsys.readouterr().err
+
+
+def test_reserved_names_never_shadow_the_core_commands(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    build = _install_command_groups(
+        monkeypatch, _FakeEntryPoint("plugins", _group), _FakeEntryPoint("run", _group)
+    )
+    built = build()
+    err = capsys.readouterr().err
+    assert "interlock: skipping command group 'plugins': name is reserved" in err
+    assert "interlock: skipping command group 'run': name is reserved" in err
+
+    result = CliRunner().invoke(built, ["plugins"])
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith("demo")
+
+
+def test_a_typer_registered_directly_is_attached_and_never_called(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build = _install_command_groups(
+        monkeypatch, _FakeEntryPoint("direct", _group(_NeverCalledTyper))
+    )
+    built = build()
+    assert _commands(built) == ["direct", "plugins", "run"]
+    result = CliRunner().invoke(built, ["direct", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "ping" in result.output
+
+
+def test_a_valid_factory_is_attached(monkeypatch: pytest.MonkeyPatch) -> None:
+    build = _install_command_groups(monkeypatch, _FakeEntryPoint("proto", _group))
+    built = build()
+    result = CliRunner().invoke(built, ["proto", "--help"])
+    assert result.exit_code == 0, result.output
+    result = CliRunner().invoke(built, ["proto", "ping"])
+    assert result.exit_code == 0, result.output
+    assert result.output == "pong\n"
+
+
+def test_the_real_cli_and_its_osdp_group_answer_help() -> None:
+    assert CliRunner().invoke(app, ["--help"]).exit_code == 0
+    result = CliRunner().invoke(app, ["osdp", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "assess" in result.output
