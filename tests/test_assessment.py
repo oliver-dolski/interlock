@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -839,6 +840,28 @@ def test_weak_key_keyset_without_the_pd_half_of_the_handshake_is_inconclusive(
     assert result.findings == ()
 
 
+def test_weak_key_keyset_with_a_truncated_ccrypt_is_inconclusive(lab_dir: Path) -> None:
+    # The REPLY_CCRYPT frame is there, but too short to carry RND.B and the PD cryptogram.
+    pair = _fixture_pair("sc-scbkd")
+    pair["pd2cp.cap"] = _with_truncated_payload(pair["pd2cp.cap"], constants.REPLY_CCRYPT, 8)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.INCONCLUSIVE, result.detail
+    assert "no REPLY_CCRYPT pd->cp captured" in result.detail
+    assert result.findings == ()
+
+
+def test_weak_key_keyset_with_a_truncated_chlng_is_inconclusive(lab_dir: Path) -> None:
+    # The CMD_CHLNG frame is there, but too short to carry the 8-byte RND.A.
+    pair = _fixture_pair("sc-scbkd")
+    pair["cp2pd.cap"] = _with_truncated_payload(pair["cp2pd.cap"], constants.CMD_CHLNG, 4)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.INCONCLUSIVE, result.detail
+    assert "no CMD_CHLNG cp->pd" in result.detail
+    assert result.findings == ()
+
+
 @pytest.mark.parametrize(
     ("key", "bring_up", "fixture"),
     [
@@ -991,6 +1014,26 @@ def _with_trailing(capture: bytes, code: int, count: int) -> bytes:
     )
     assert raw is not None, f"no frame with code {code:#04x} in the capture"
     return capture + raw * count
+
+
+def _with_truncated_payload(capture: bytes, code: int, keep: int) -> bytes:
+    """Return ``capture`` with the payload of every frame with ``code`` cut to ``keep`` bytes.
+
+    Models a CRC-valid handshake frame whose payload is too short for the verdict parsers:
+    each cut frame is re-encoded, so LEN and CRC are recomputed and the framer still accepts
+    it. 0x76 is CMD_CHLNG cp->pd and REPLY_CCRYPT pd->cp, so apply it to one direction only.
+    """
+    out = bytearray()
+    cut = 0
+    for raw in framer.iter_frames(capture):
+        frame = codec.decode(raw)
+        if frame.code == code:
+            out += codec.encode(replace(frame, data=frame.data[:keep]))
+            cut += 1
+        else:
+            out += raw
+    assert cut, f"no frame with code {code:#04x} in the capture"
+    return bytes(out)
 
 
 def _without_ccrypt(capture: bytes) -> bytes:
