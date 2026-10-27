@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "interlock-example"
+version = "0.0.0"
+description = "The minimal interlock plugin from the plugin-authoring guide."
+requires-python = ">=3.11"
+dependencies = ["interlock"]
+
+# The plugin object: listed by `interlock plugins`, run by `interlock run example`.
+[project.entry-points."interlock.plugins"]
+example = "interlock_example:ExamplePlugin"
+
+# The command group: attached as `interlock example`.
+[project.entry-points."interlock.commands"]
+example = "interlock_example:build_example_app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/interlock_example"]
