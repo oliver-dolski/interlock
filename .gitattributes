@@ -1,0 +1,10 @@
+# A Windows checkout must not convert these: capture fixtures and images are bytes,
+# and shell scripts, git hooks and Dockerfiles run in Linux or under sh, where a CR
+# breaks them (the lab is built from a PowerShell checkout too).
+*.cap binary
+*.gif binary
+*.png binary
+*.sh text eol=lf
+.githooks/* text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
