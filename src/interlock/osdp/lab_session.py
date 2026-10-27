@@ -12,6 +12,8 @@ checked before any command runs. The pinned-vulnerable core override is delibera
 from the allow-list (D-03). Every command is a list argv handed to ``subprocess.run`` without a
 shell. It adds no published port and changes no compose file, so SAFE-01 containment is
 unchanged: captures leave the attacker container only as base64 over ``docker compose exec``.
+``check_containment`` proves that per file set before anything runs: it resolves the files with
+``docker compose config`` and reports every ``CONTAINMENT_RULES`` violation (WR-07).
 
 The runner, sleep and clock are injectable, so the host suite proves every path without Docker.
 """
@@ -19,6 +21,7 @@ The runner, sleep and clock are injectable, so the host suite proves every path 
 from __future__ import annotations
 
 import base64
+import json
 import os
 import shutil
 import subprocess
@@ -53,6 +56,15 @@ ALLOWED_OVERRIDES = frozenset(
 COMPOSE_FILE = "docker-compose.yml"
 _TAP_FILE = "docker-compose.tap.yml"
 
+# The bus topology the lab is wired for (WR-03). docker-compose.yml interpolates both from the
+# environment with these defaults, so a value left in the operator's shell would reroute the
+# lab, e.g. the cp straight to the pd past the attacker. Pinned for every compose call.
+_PINNED_TOPOLOGY = {"CP_UPSTREAM": "attacker:10000", "ATTACKER_UPSTREAM": "pd:10000"}
+
+# What the preflight proves of every resolved compose file set before anything runs (WR-07).
+# The report's Containment line names exactly these, so it never claims an unchecked rule.
+CONTAINMENT_RULES: tuple[str, ...] = ("every network internal", "no published ports")
+
 # Upper bound on the stderr carried into a LabError, so a noisy build cannot flood a report.
 _STDERR_TAIL = 2000
 
@@ -74,6 +86,66 @@ def _failure(what: str, result: subprocess.CompletedProcess[str]) -> str:
     """Describe a failed command by name, exit code and a bounded stderr tail (never the env)."""
     tail = (result.stderr or "").strip()[-_STDERR_TAIL:]
     return f"docker compose {what} failed (exit {result.returncode}): {tail}"
+
+
+def _lab_env(profile: str | None) -> dict[str, str]:
+    """Return the environment for a compose call: the topology pinned, LAB_SCENARIO if given.
+
+    The rest of ``os.environ`` is kept, since DOCKER_HOST, DOCKER_CONTEXT and PATH decide which
+    Docker the call reaches. The process env beats any env file, so pinning here is enough.
+    """
+    env = {key: value for key, value in os.environ.items() if key not in _PINNED_TOPOLOGY}
+    env.update(_PINNED_TOPOLOGY)
+    if profile is not None:
+        env["LAB_SCENARIO"] = profile
+    return env
+
+
+def _check_overrides(overrides: Sequence[str]) -> None:
+    """Raise unless ``overrides`` is a sequence of names from ``ALLOWED_OVERRIDES``."""
+    if isinstance(overrides, str):
+        raise TypeError("overrides must be a sequence of file names, not a single string")
+    for override in overrides:
+        if override not in ALLOWED_OVERRIDES:
+            raise ValueError(f"compose override {override!r} is not allowed; expected "
+                             f"one of {sorted(ALLOWED_OVERRIDES)}")
+
+
+def containment_violations(config: Mapping[str, object]) -> list[str]:
+    """Return every containment rule a resolved ``docker compose config`` document breaks.
+
+    Pure and total: a missing or malformed section is itself a violation, never an exception.
+    Each text names the network or service and the key, never a value, so no host path from
+    the resolved config can reach a message or a report.
+    """
+    violations: list[str] = []
+    networks = config.get("networks")
+    if not isinstance(networks, Mapping):
+        violations.append("networks: missing or not a mapping")
+    else:
+        for name, network in networks.items():
+            if not isinstance(network, Mapping) or network.get("internal") is not True:
+                violations.append(f"network {name}: internal is not true")
+    services = config.get("services")
+    if not isinstance(services, Mapping):
+        violations.append("services: missing or not a mapping")
+    else:
+        for name, service in services.items():
+            if not isinstance(service, Mapping):
+                violations.append(f"service {name}: not a mapping")
+            elif service.get("ports"):
+                violations.append(f"service {name}: ports publishes a port to the host")
+    return violations
+
+
+def containment_sentence(files: Sequence[str]) -> str:
+    """Describe the containment check the preflight ran over ``files`` (base file first)."""
+    base, *overrides = files
+    return (
+        f"checked before the run with docker compose config over {base} plus each of "
+        f"{len(overrides)} overrides: {', '.join(CONTAINMENT_RULES)}; no real hardware is "
+        "reachable from the assessment"
+    )
 
 
 def make_runner(lab_dir: Path) -> Runner:
@@ -180,6 +252,26 @@ class LabSession:
             files += ["-f", str(self.lab_dir / override)]
         return ["docker", "compose", "-p", self.project, *files]
 
+    def check_containment(self, overrides: Sequence[str]) -> list[str]:
+        """Resolve the base file plus ``overrides`` and return its containment violations.
+
+        Runs ``docker compose config --format json`` (the docker CLI, no container started)
+        with the pinned topology. Fails closed: a non-zero exit or output that is not a JSON
+        object is itself a violation. An empty list means every ``CONTAINMENT_RULES`` holds.
+        """
+        _check_overrides(overrides)
+        argv = [*self._base_cmd(overrides), "config", "--format", "json"]
+        result = self._runner(argv, _lab_env("cleartext"))
+        if result.returncode != 0:
+            return [_failure("config", result)]
+        try:
+            parsed = json.loads(result.stdout)
+        except ValueError:
+            parsed = None
+        if not isinstance(parsed, dict):
+            return ["docker compose config did not print a JSON object"]
+        return containment_violations(parsed)
+
     def reset(self) -> None:
         """Run ``down -v`` once for the project to clear leftovers of an interrupted run."""
         self._runner([*self._base_cmd(()), "down", "-v"], dict(os.environ))
@@ -192,10 +284,7 @@ class LabSession:
         if profile not in LAB_PROFILES:
             raise ValueError(f"unknown lab profile {profile!r}; expected one of "
                              f"{sorted(LAB_PROFILES)}")
-        for override in overrides:
-            if override not in ALLOWED_OVERRIDES:
-                raise ValueError(f"compose override {override!r} is not allowed; expected "
-                                 f"one of {sorted(ALLOWED_OVERRIDES)}")
+        _check_overrides(overrides)
 
         base_cmd = self._base_cmd(overrides)
         env = {**os.environ, "LAB_SCENARIO": profile}

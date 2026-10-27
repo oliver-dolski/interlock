@@ -6,8 +6,11 @@ JSON report next to it (same stem, ``.json``), both carrying the authorized-use 
 
 Lab-only (D-04): there is no --physical, --device or --target option and this module imports
 nothing from the physical (SAFE-02) path. Preflight fails closed with exit 2 before anything is
-written: Docker not on PATH, no lab dir, a required compose file missing, or a ``.json``
-output path (which would collide with the JSON written next to the Markdown).
+written: Docker not on PATH, no lab dir, a required compose file missing, a ``.json``
+output path (which would collide with the JSON written next to the Markdown), or a compose
+file pair (the base plus one override, as each bring-up layers them) whose resolved
+``docker compose config`` breaks a ``lab_session.CONTAINMENT_RULES`` rule or cannot be
+resolved. The report's Containment line states that check, not an assumption.
 
 Exit codes: 0 when every step completed (vulnerable or not_vulnerable), 1 when the reports
 were written but a step is inconclusive or error, 2 when preflight fails.
@@ -63,9 +66,18 @@ def register(app: typer.Typer) -> None:
             lab_dir = lab_session.find_lab_dir(Path.cwd())
             if lab_dir is None:
                 fail("no lab dir found in the cwd or its parents; pass --lab-dir")
-        missing = [name for name in assessment.required_files() if not (lab_dir / name).is_file()]
+        files = assessment.required_files()
+        missing = [name for name in files if not (lab_dir / name).is_file()]
         if missing:
             fail(f"lab dir {lab_dir} lacks {', '.join(missing)}")
+        session = lab_session.LabSession(lab_dir, runner=lab_session.make_runner(lab_dir))
+        # Every bring-up layers exactly one override on the base, so each pair is checked.
+        base, *overrides = files
+        for override in overrides:
+            violations = session.check_containment((override,))
+            if violations:
+                fail(f"containment check failed for {base} + {override}: "
+                     f"{'; '.join(violations)}")
 
         typer.echo(
             "Running the OSDP assessment against the bundled lab. The first run builds the "
@@ -78,10 +90,14 @@ def register(app: typer.Typer) -> None:
                 f"({len(result.findings)} findings, {result.duration_s:.1f} s)"
             )
 
-        session = lab_session.LabSession(lab_dir, runner=lab_session.make_runner(lab_dir))
         results = assessment.run_assessment(session, on_step=on_step)
         generated_at = datetime.now(UTC).isoformat(timespec="seconds")
-        json_path = assessment.write_reports(results, output, generated_at=generated_at)
+        json_path = assessment.write_reports(
+            results,
+            output,
+            generated_at=generated_at,
+            containment=lab_session.containment_sentence(files),
+        )
         assessment.render_step_table(results)
         typer.echo(f"Wrote Markdown report to {output}")
         typer.echo(f"Wrote JSON report to {json_path}")

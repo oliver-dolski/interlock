@@ -914,13 +914,14 @@ def coverage(results: Sequence[StepResult], steps: Sequence[Step] = STEPS) -> li
     return rows
 
 
-def _scope(results: Sequence[StepResult], generated_at: str) -> list[str]:
+# The Containment line of a report written without a containment check result (WR-07).
+_CONTAINMENT_NOT_CHECKED = "not checked by this run"
+
+
+def _scope(results: Sequence[StepResult], generated_at: str, containment: str) -> list[str]:
     profiles = ", ".join(dict.fromkeys(result.profile for result in results)) or "none"
     vector = _named(attack_map.ACCESS_VECTOR.enterprise, attack_map.ACCESS_VECTOR.enterprise_name)
-    target = (
-        "the bundled, network-isolated lab (no published ports), compose project "
-        f"{lab_session.DEFAULT_PROJECT}; no real hardware is reachable from the assessment"
-    )
+    target = f"the bundled lab, compose project {lab_session.DEFAULT_PROJECT}"
     core = (
         "LibOSDP 3.0.8 (fixed); the pinned-vulnerable CVE-2024-52288 core is not part of the "
         "default run"
@@ -933,6 +934,7 @@ def _scope(results: Sequence[StepResult], generated_at: str) -> list[str]:
         "## Scope",
         "",
         f"- **Target:** {target}.",
+        f"- **Containment:** {containment}.",
         f"- **Profiles run:** {profiles}",
         f"- **Core under test:** {core}.",
         f"- **Framework:** {framework}.",
@@ -1021,15 +1023,27 @@ def _step_dict(result: StepResult) -> dict[str, object]:
     }
 
 
-def write_reports(results: Sequence[StepResult], md_path: Path, *, generated_at: str) -> Path:
+def write_reports(
+    results: Sequence[StepResult],
+    md_path: Path,
+    *,
+    generated_at: str,
+    containment: str | None = None,
+) -> Path:
     """Write the Markdown report to ``md_path`` and the JSON next to it; return the JSON path.
 
-    The Markdown reads: title and authorized-use notice, Scope (lab target, profiles, core,
-    ATT&CK version, access vector), Summary (severity counts, step table), Coverage (every
-    attack's result and techniques), Findings in step order with "ID (Name)" techniques, then
-    the checks without a finding and every step's method note. The JSON mirrors it for CI.
-    Neither report carries raw capture bytes, tracebacks or environment data.
+    The Markdown reads: title and authorized-use notice, Scope (lab target, containment,
+    profiles, core, ATT&CK version, access vector), Summary (severity counts, step table),
+    Coverage (every attack's result and techniques), Findings in step order with "ID (Name)"
+    techniques, then the checks without a finding and every step's method note. The JSON
+    mirrors it for CI. Neither report carries raw capture bytes, tracebacks or environment data.
+
+    ``containment`` is the result of the containment check the caller ran before the run
+    (``lab_session.containment_sentence``); without one, both reports say containment was not
+    checked by this run instead of asserting it (WR-07).
     """
+    checked = containment is not None
+    containment_text = containment if containment is not None else _CONTAINMENT_NOT_CHECKED
     findings = [finding for result in results for finding in result.findings]
     rows = coverage(results)
     report.write_markdown(
@@ -1037,7 +1051,7 @@ def write_reports(results: Sequence[StepResult], md_path: Path, *, generated_at:
         md_path,
         title=REPORT_TITLE,
         preamble=[
-            *_scope(results, generated_at),
+            *_scope(results, generated_at, containment_text),
             *_summary(results),
             *_coverage_table(rows),
             "## Findings",
@@ -1055,6 +1069,7 @@ def write_reports(results: Sequence[StepResult], md_path: Path, *, generated_at:
             "tool": {"name": "interlock", "version": interlock.__version__},
             "generated_at": generated_at,
             "target": {"kind": "lab", "project": lab_session.DEFAULT_PROJECT},
+            "containment": {"checked": checked, "detail": containment_text},
             "attack_version": attack_map.ATTACK_VERSION,
             "access_vector": {"enterprise": vector.enterprise, "name": vector.enterprise_name},
             "coverage": [_coverage_dict(row) for row in rows],
