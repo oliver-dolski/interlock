@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
+
+import pytest
 
 from interlock.osdp.transport import (
     Direction,
@@ -133,12 +136,14 @@ def _run_fd_pump(transform: Callable[[Direction, bytes], bytes], sent: bytes) ->
                 pass
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pty/pipe select")
 def test_fd_rewrite_forwards_modified_bytes() -> None:
     modified = SENT.replace(b"\x60", b"\x6e")
     forwarded = _run_fd_pump(lambda direction, data: data.replace(b"\x60", b"\x6e"), SENT)
     assert forwarded == modified
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pty/pipe select")
 def test_fd_rewrite_passes_through_byte_identically() -> None:
     forwarded = _run_fd_pump(lambda direction, data: data, SENT)
     assert forwarded == SENT

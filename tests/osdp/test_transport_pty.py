@@ -12,9 +12,12 @@ codec.decode recovers the original frames from what the tap saw.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING
+
+import pytest
 
 from interlock.osdp import framer
 from interlock.osdp.codec import OsdpFrame, decode, encode
@@ -44,6 +47,7 @@ def _read_exact(port: serial.Serial, count: int, *, timeout: float = 3.0) -> byt
     return bytes(buffer)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pty/pipe select")
 def test_pty_tap_relays_and_observes_both_directions() -> None:
     observed: dict[Direction, bytearray] = {
         Direction.cp_to_pd: bytearray(),
