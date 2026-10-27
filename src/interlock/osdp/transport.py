@@ -12,7 +12,8 @@ own gate. Observing a copy keeps the live session unaffected (SAFE-01).
 The module is standard-library only at import time so it runs in the minimal lab
 image. pyserial is imported lazily inside ``open_serial_endpoint`` (and only for
 type checking at module scope), and nothing here imports cryptography: the TCP tap
-must run where neither is installed.
+must run where neither is installed. The pty tap is POSIX only: ``tty`` is imported
+inside ``PtyTap`` so the module itself imports on Windows.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ import select
 import socket
 import threading
 import time
-import tty
 from collections.abc import Callable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
@@ -340,6 +340,8 @@ class PtyTap:
         # mangles binary (CR<->NL translation, XON/XOFF flow control on 0x11/0x13,
         # canonical buffering), which would corrupt OSDP frames. Raw mode makes the
         # relay a faithful byte pipe in both directions, including the raw-fd fallback.
+        import tty  # POSIX only; imported here so the module imports on Windows (D-08)
+
         tty.setraw(self._slave_cp)
         tty.setraw(self._slave_pd)
         # Slave device paths the CP and PD endpoints open; the tap holds the masters.
