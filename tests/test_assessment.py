@@ -1153,6 +1153,94 @@ def test_replay_after_sniff_enumerate_uses_its_live_capture(lab_dir: Path) -> No
     assert _finding_ids(results[1]) == {"ATK-05a-replay-card-exchange"}
 
 
+# ---------------------------------------------------------------------------------------------
+# Long captures: the bus keeps polling until the capture is read, so a direction can run past
+# its frame cap. Every capture step keeps its PD evidence, and none calls a long capture clean.
+
+
+def _long_cleartext_sniff_captures() -> dict[str, bytes]:
+    pair = _fixture_pair("cleartext")
+    pair["cp2pd.cap"] = _with_trailing(pair["cp2pd.cap"], constants.CMD_POLL, _PAST_SNIFF_CAP)
+    return pair
+
+
+def test_sniff_enumerate_with_cp_to_pd_past_the_cap_still_enumerates_the_pd(
+    lab_dir: Path,
+) -> None:
+    fake = FakeCompose(captures=_long_cleartext_sniff_captures())
+    [result] = _run_steps(lab_dir, fake, "sniff-enumerate")
+    assert result.status is Status.VULNERABLE
+    assert {"ATK-01-sniff-pd-101", "ATK-02-enumerate-pd-101"} <= _finding_ids(result)
+
+
+def test_replay_after_a_long_sniff_capture_still_finds_the_card_read(lab_dir: Path) -> None:
+    fake = FakeCompose(captures=_long_cleartext_sniff_captures())
+    results = _run_steps(lab_dir, fake, "sniff-enumerate", "replay")
+    assert [r.status for r in results] == [Status.VULNERABLE, Status.VULNERABLE]
+    assert _finding_ids(results[1]) == {"ATK-05a-replay-card-exchange"}
+
+
+def test_downgrade_with_long_captures_is_still_vulnerable(lab_dir: Path) -> None:
+    baseline = _fixture_pair("downgrade")
+    attacked = _fixture_pair("cleartext")
+    for pair in (baseline, attacked):
+        pair["cp2pd.cap"] = _with_trailing(pair["cp2pd.cap"], constants.CMD_POLL, _PAST_SNIFF_CAP)
+    fake = FakeCompose(
+        bring_up_captures={("downgrade", _TAP): baseline, ("downgrade", _DOWNGRADE): attacked}
+    )
+    [result] = _run_steps(lab_dir, fake, "downgrade")
+    assert result.status is Status.VULNERABLE
+    assert "ATK-03-downgrade" in _finding_ids(result)
+
+
+def test_weak_key_keyset_with_both_directions_past_the_cap_is_still_vulnerable(
+    lab_dir: Path,
+) -> None:
+    pair = _fixture_pair("keyset")
+    pair["cp2pd.cap"] = _with_trailing(pair["cp2pd.cap"], constants.CMD_POLL, _PAST_WEAK_KEY_CAP)
+    pair["pd2cp.cap"] = _with_trailing(pair["pd2cp.cap"], constants.REPLY_ACK, _PAST_WEAK_KEY_CAP)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.VULNERABLE
+    assert {"ATK-06-weak-key", "ATK-04-keyset"} <= _finding_ids(result)
+
+
+# Which directions a long-capture case pads: cp->pd with polls, pd->cp with acks.
+_LONG_SHAPES = {"cp2pd": ("cp2pd.cap",), "pd2cp": ("pd2cp.cap",), "both": ("cp2pd.cap", "pd2cp.cap")}
+_PAD_CODE = {"cp2pd.cap": constants.CMD_POLL, "pd2cp.cap": constants.REPLY_ACK}
+_LONG_CAPTURE_CASES = [
+    pytest.param(key, bring_up, fixture, padded, count, id=f"{key}-{fixture}-{shape}")
+    for key, bring_up, fixtures, count in (
+        ("sniff-enumerate", _SNIFF_BRING_UP, ("cleartext",), _PAST_SNIFF_CAP),
+        (
+            "weak-key-keyset",
+            ("sc-scbkd", _TAP),
+            ("sc-scbkd", "keyset", "downgrade"),
+            _PAST_WEAK_KEY_CAP,
+        ),
+    )
+    for fixture in fixtures
+    for shape, padded in _LONG_SHAPES.items()
+]
+
+
+@pytest.mark.parametrize(("key", "bring_up", "fixture", "padded", "count"), _LONG_CAPTURE_CASES)
+def test_a_long_capture_is_never_reported_not_vulnerable(
+    lab_dir: Path,
+    key: str,
+    bring_up: tuple[str, str],
+    fixture: str,
+    padded: tuple[str, ...],
+    count: int,
+) -> None:
+    pair = _fixture_pair(fixture)
+    for basename in padded:
+        pair[basename] = _with_trailing(pair[basename], _PAD_CODE[basename], count)
+    fake = FakeCompose(bring_up_captures={bring_up: pair})
+    [result] = _run_steps(lab_dir, fake, key)
+    assert result.status in {Status.VULNERABLE, Status.INCONCLUSIVE}, result.detail
+
+
 def test_cve_fixed_core_rejecting_the_replayed_rmac_i_is_not_vulnerable(lab_dir: Path) -> None:
     fake = FakeCompose()
     [result] = _run_steps(lab_dir, fake, "cve-2024-52288-fixed")
