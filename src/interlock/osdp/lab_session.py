@@ -13,7 +13,9 @@ from the allow-list (D-03). Every command is a list argv handed to ``subprocess.
 shell. It adds no published port and changes no compose file, so SAFE-01 containment is
 unchanged: captures leave the attacker container only as base64 over ``docker compose exec``.
 ``check_containment`` proves that per file set before anything runs: it resolves the files with
-``docker compose config`` and reports every ``CONTAINMENT_RULES`` violation (WR-07).
+``docker compose config`` and reports every ``CONTAINMENT_RULES`` violation (WR-07). Every
+compose call runs with the bus topology pinned (``_PINNED_TOPOLOGY``), so a CP_UPSTREAM or
+ATTACKER_UPSTREAM left in the operator's shell cannot reroute the lab (WR-03).
 
 The runner, sleep and clock are injectable, so the host suite proves every path without Docker.
 """
@@ -158,6 +160,9 @@ def make_runner(lab_dir: Path) -> Runner:
             env=dict(env),
             capture_output=True,
             text=True,
+            # Docker prints UTF-8; the platform default (cp1252 on Windows) would crash on it.
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
 
@@ -274,7 +279,7 @@ class LabSession:
 
     def reset(self) -> None:
         """Run ``down -v`` once for the project to clear leftovers of an interrupted run."""
-        self._runner([*self._base_cmd(()), "down", "-v"], dict(os.environ))
+        self._runner([*self._base_cmd(()), "down", "-v"], _lab_env(None))
 
     @contextmanager
     def scenario(self, profile: str, overrides: Sequence[str] = ()) -> Iterator[LabHandle]:
@@ -287,7 +292,7 @@ class LabSession:
         _check_overrides(overrides)
 
         base_cmd = self._base_cmd(overrides)
-        env = {**os.environ, "LAB_SCENARIO": profile}
+        env = _lab_env(profile)
         try:
             # --force-recreate is load-bearing for two-phase runs (downgrade: baseline then
             # attacked in one project). A second bring-up only swaps the attacker service;

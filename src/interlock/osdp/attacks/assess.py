@@ -65,7 +65,9 @@ def register(app: typer.Typer) -> None:
         if lab_dir is None:
             lab_dir = lab_session.find_lab_dir(Path.cwd())
             if lab_dir is None:
-                fail("no lab dir found in the cwd or its parents; pass --lab-dir")
+                fail("no lab dir found in the cwd or its parents; the lab ships with the "
+                     "source repository, not the wheel: clone the repository and run from its "
+                     "root, or pass --lab-dir")
         files = assessment.required_files()
         missing = [name for name in files if not (lab_dir / name).is_file()]
         if missing:
