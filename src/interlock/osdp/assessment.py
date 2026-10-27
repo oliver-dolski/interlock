@@ -8,8 +8,9 @@ records one ``StepResult`` per step with an explicit ``Status``:
 
 - findings -> ``vulnerable``; no findings -> ``not_vulnerable`` (only after the step proved
   its precondition and ran to completion);
-- ``Inconclusive`` raised by the step (an unmet precondition: PD never online, empty capture)
-  -> ``inconclusive``, never a silent clean result;
+- ``Inconclusive`` raised by the step (an unmet precondition: PD never online, empty capture,
+  a capture that decodes to no OSDP frame, a missing handshake half) -> ``inconclusive``,
+  never a silent clean result;
 - any other ``Exception`` -> ``error`` with ``"TypeName: message"``; the traceback goes to
   stderr only, never into a report. ``KeyboardInterrupt`` is not caught, so Ctrl-C unwinds
   through the scenario's ``finally`` and the lab is still torn down.
@@ -149,18 +150,62 @@ _DIRECTION_LABEL: dict[Direction, str] = {
 }
 
 
+@dataclass(frozen=True)
+class _Capture:
+    """Both decoded tap captures of one bring-up, and where decoding stopped at the cap.
+
+    ``frames`` holds the cp->pd frames, then the pd->cp frames. ``capped`` names, in that
+    order, every direction whose decode returned ``max_frames`` frames: exactly the cap counts
+    as cut, so a clean verdict never rests on a capture that may continue past it.
+    """
+
+    frames: Frames
+    captured_bytes: int
+    max_frames: int
+    capped: tuple[str, ...]
+
+    @property
+    def cap_note(self) -> str:
+        """Name the directions that reached the frame cap, or "" when none did."""
+        if not self.capped:
+            return ""
+        return f"decoding stopped at the {self.max_frames}-frame cap in {' and '.join(self.capped)}"
+
+    @property
+    def detail(self) -> str:
+        """Frame counts per direction and captured bytes; counts and labels only."""
+        counts = {direction: 0 for direction in _DIRECTION_LABEL}
+        for direction, _ in self.frames:
+            counts[direction] += 1
+        detail = (
+            f"{counts[Direction.cp_to_pd]} cp->pd and {counts[Direction.pd_to_cp]} pd->cp "
+            f"frames decoded from {self.captured_bytes} captured bytes"
+        )
+        return f"{detail}; {self.cap_note}" if self.cap_note else detail
+
+
 def _decode_direction(direction: Direction, data: bytes, *, max_frames: int) -> Frames:
-    """Decode one direction's capture on its own, under its own ``max_frames`` cap."""
-    return decode_chunks([(direction, data)], max_frames=max_frames)
+    """Decode one direction's capture on its own, under its own ``max_frames`` cap.
+
+    Raises ``Inconclusive`` when the bytes hold no OSDP frame: a non-empty capture that decodes
+    to nothing proves nothing, the same as an empty one.
+    """
+    frames = decode_chunks([(direction, data)], max_frames=max_frames)
+    if not frames:
+        raise Inconclusive(
+            f"the {_DIRECTION_LABEL[direction]} tap capture decoded to no OSDP frame"
+        )
+    return frames
 
 
-def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> tuple[Frames, int]:
+def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> _Capture:
     """Gate on a full session, read both per-direction captures and decode them.
 
     Each direction is decoded under its own ``max_frames`` cap, so a long cp->pd capture (the
-    CP polls until the capture is read) can never starve the pd->cp half. Returns the decoded
-    frames, cp->pd first, and the number of captured bytes. Raises ``Inconclusive`` when the
-    PD never came online, no card-read event was seen or a capture is empty.
+    CP polls until the capture is read) can never starve the pd->cp half. Returns a
+    ``_Capture`` with the frames, cp->pd first, the captured byte count and the directions that
+    reached the cap. Raises ``Inconclusive`` when the PD never came online, no card-read event
+    was seen, or a capture is empty or decodes to no OSDP frame.
     """
     _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
     _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
@@ -170,23 +215,29 @@ def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> tu
         raise Inconclusive("the cp->pd tap capture is empty")
     if not pd2cp:
         raise Inconclusive("the pd->cp tap capture is empty")
-    frames = [
-        *_decode_direction(Direction.cp_to_pd, cp2pd, max_frames=max_frames),
-        *_decode_direction(Direction.pd_to_cp, pd2cp, max_frames=max_frames),
-    ]
-    return frames, len(cp2pd) + len(pd2cp)
+    decoded = {
+        direction: _decode_direction(direction, data, max_frames=max_frames)
+        for direction, data in ((Direction.cp_to_pd, cp2pd), (Direction.pd_to_cp, pd2cp))
+    }
+    return _Capture(
+        frames=[*decoded[Direction.cp_to_pd], *decoded[Direction.pd_to_cp]],
+        captured_bytes=len(cp2pd) + len(pd2cp),
+        max_frames=max_frames,
+        capped=tuple(
+            _DIRECTION_LABEL[direction]
+            for direction, frames in decoded.items()
+            if len(frames) >= max_frames
+        ),
+    )
 
 
 def _sniff_enumerate(session: LabSession, context: dict[str, object]) -> StepOutput:
     """Read both live tap captures and fold them into ATK-01 and ATK-02 findings."""
     with session.scenario(_SNIFF_PROFILE, _SNIFF_OVERRIDES) as lab:
-        frames, captured = _capture_session(lab)
-    context["cleartext_frames"] = frames
-    findings = [*run_sniff(frames), *run_enumerate(frames)]
-    return StepOutput(
-        findings=tuple(findings),
-        detail=f"{len(frames)} frames decoded from {captured} captured bytes",
-    )
+        capture = _capture_session(lab)
+    context["cleartext_frames"] = capture.frames
+    findings = [*run_sniff(capture.frames), *run_enumerate(capture.frames)]
+    return StepOutput(findings=tuple(findings), detail=capture.detail)
 
 
 # fuzz: the cleartext lab under docker-compose.fuzz.yml (the CP idles so the PD's single
@@ -286,18 +337,27 @@ _WEAK_KEY_MAX_FRAMES = 400
 def _weak_key_keyset(session: LabSession, context: dict[str, object]) -> StepOutput:
     """Check the live Secure Channel handshake for SCBK-D and decrypt any KEYSET on the bus."""
     with session.scenario(_WEAK_KEY_PROFILE, _WEAK_KEY_OVERRIDES) as lab:
-        frames, captured = _capture_session(lab, max_frames=_WEAK_KEY_MAX_FRAMES)
+        capture = _capture_session(lab, max_frames=_WEAK_KEY_MAX_FRAMES)
+    frames = capture.frames
     cp_codes = {frame.code for direction, frame in frames if direction is Direction.cp_to_pd}
+    pd_codes = {frame.code for direction, frame in frames if direction is Direction.pd_to_cp}
     if constants.CMD_CHLNG not in cp_codes:
         raise Inconclusive(
             "no Secure Channel handshake captured (no CMD_CHLNG cp->pd), so neither the key "
             "check nor the KEYSET decryption had anything to work on"
         )
+    if constants.REPLY_CCRYPT not in pd_codes:
+        raise Inconclusive(
+            "no REPLY_CCRYPT pd->cp captured (the PD half of the Secure Channel handshake), so "
+            "no key verdict is possible"
+        )
     findings = [*run_weak_key(frames), *run_keyset(frames)]
-    return StepOutput(
-        findings=tuple(findings),
-        detail=f"{len(frames)} frames decoded from {captured} captured bytes",
-    )
+    if not findings and capture.capped:
+        raise Inconclusive(
+            f"no known weak key matched the captured handshake, but {capture.cap_note}, so the "
+            "matching handshake may lie past it"
+        )
+    return StepOutput(findings=tuple(findings), detail=capture.detail)
 
 
 # downgrade: the downgrade profile twice, untouched under the tap, then under the relay.
@@ -309,14 +369,14 @@ _DOWNGRADE_ATTACKED = ("docker-compose.downgrade.yml",)
 def _downgrade(session: LabSession, context: dict[str, object]) -> StepOutput:
     """Capture an untouched secure session, then one through the stripping relay; compare."""
     with session.scenario(_DOWNGRADE_PROFILE, _DOWNGRADE_BASELINE) as lab:
-        baseline, _ = _capture_session(lab)
+        baseline = _capture_session(lab).frames
     if not secure_channel.detect_state(baseline).secure:
         raise Inconclusive("baseline was not Secure Channel")
     if not downgrade._advertises_communication_security(baseline):
         raise Inconclusive("baseline advertised no CommunicationSecurity to strip")
 
     with session.scenario(_DOWNGRADE_PROFILE, _DOWNGRADE_ATTACKED) as lab:
-        attacked, _ = _capture_session(lab)
+        attacked = _capture_session(lab).frames
     findings = downgrade.run_downgrade(baseline, attacked)
     if findings:
         return StepOutput(
