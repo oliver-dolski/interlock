@@ -86,10 +86,15 @@ class Inconclusive(Exception):
 
 @dataclass(frozen=True)
 class StepOutput:
-    """What a step function returns: its findings and an optional detail line."""
+    """What a step function returns: its findings, an optional detail line, capped directions.
+
+    ``capped`` labels (such as "cp->pd") every capture direction whose decode reached the
+    frame cap; a capture step passes its ``_Capture.capped`` through.
+    """
 
     findings: tuple[Finding, ...]
     detail: str = ""
+    capped: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,7 +116,11 @@ class Step:
 
 @dataclass(frozen=True)
 class StepResult:
-    """The recorded outcome of one step."""
+    """The recorded outcome of one step.
+
+    ``capped`` names the capture directions that reached the frame cap in a completed step, so
+    a sub-attack without a finding is never reported clean on a capture that may continue.
+    """
 
     key: str
     title: str
@@ -122,6 +131,7 @@ class StepResult:
     detail: str
     method: str
     duration_s: float
+    capped: tuple[str, ...] = ()
 
 
 def _require_log(
@@ -237,7 +247,7 @@ def _sniff_enumerate(session: LabSession, context: dict[str, object]) -> StepOut
         capture = _capture_session(lab)
     context["cleartext_frames"] = capture.frames
     findings = [*run_sniff(capture.frames), *run_enumerate(capture.frames)]
-    return StepOutput(findings=tuple(findings), detail=capture.detail)
+    return StepOutput(findings=tuple(findings), detail=capture.detail, capped=capture.capped)
 
 
 # fuzz: the cleartext lab under docker-compose.fuzz.yml (the CP idles so the PD's single
@@ -330,8 +340,10 @@ def _fuzz(session: LabSession, context: dict[str, object]) -> StepOutput:
 # weak-key-keyset: the install-mode sc-scbkd lab under the read-only tap.
 _WEAK_KEY_PROFILE = "sc-scbkd"
 _WEAK_KEY_OVERRIDES = ("docker-compose.tap.yml",)
-# The frame cap is per direction; 400 keeps CMD_KEYSET in reach on the install-mode bus.
-_WEAK_KEY_MAX_FRAMES = 400
+# The frame ceiling is per direction and bounds bytes, not where the handshake sits: 20000
+# frames decode in about 0.04 s, so a slow host's long tail of polls never cuts a clean bus.
+# A direction that still reaches it is treated as cut.
+_WEAK_KEY_MAX_FRAMES = 20_000
 
 
 def _weak_key_keyset(session: LabSession, context: dict[str, object]) -> StepOutput:
@@ -360,7 +372,7 @@ def _weak_key_keyset(session: LabSession, context: dict[str, object]) -> StepOut
             f"no known weak key matched the captured handshake, but {capture.cap_note}, so the "
             "matching handshake may lie past it"
         )
-    return StepOutput(findings=tuple(findings), detail=capture.detail)
+    return StepOutput(findings=tuple(findings), detail=capture.detail, capped=capture.capped)
 
 
 # downgrade: the downgrade profile twice, untouched under the tap, then under the relay.
@@ -601,7 +613,9 @@ STEPS: tuple[Step, ...] = (
         run=_weak_key_keyset,
         method=(
             "passive: read-only TCP tap on the install-mode Secure Channel bus; AES-verified "
-            "SCBK-D check and KEYSET payload decryption on the host"
+            "SCBK-D check and KEYSET payload decryption on the host; each direction is decoded "
+            f"up to the {_WEAK_KEY_MAX_FRAMES}-frame ceiling and a clean result from a direction "
+            "that reaches it is inconclusive"
         ),
         clean_detail=(
             "The captured handshake used no known weak key and no KEYSET payload decrypted."
@@ -692,6 +706,7 @@ def run_assessment(
     for index, step in enumerate(steps, start=1):
         started = clock()
         findings: tuple[Finding, ...] = ()
+        capped: tuple[str, ...] = ()
         try:
             output = step.run(session, context)
         except Inconclusive as exc:
@@ -701,6 +716,7 @@ def run_assessment(
             status, detail = Status.ERROR, _describe(exc)
         else:
             findings = tuple(output.findings)
+            capped = tuple(output.capped)
             if findings:
                 status, detail = Status.VULNERABLE, output.detail
             else:
@@ -715,6 +731,7 @@ def run_assessment(
             detail=detail,
             method=step.method,
             duration_s=round(clock() - started, 1),
+            capped=capped,
         )
         results.append(result)
         if on_step is not None:
@@ -799,9 +816,10 @@ def coverage(results: Sequence[StepResult], steps: Sequence[Step] = STEPS) -> li
     """Return one row per (attack key, finding-id prefix) of ``steps``, in run order.
 
     The result is the comma-joined finding ids carrying the attack's prefix; "no finding" when
-    the step completed without one; otherwise the step's own status (inconclusive or error),
-    so a negative is never hidden inside a vulnerable step. An attack whose step is absent
-    from ``results`` reads "not run".
+    the step completed without one on an uncut capture; "inconclusive" when the step completed
+    but its capture reached the frame cap, so a capped capture never hides a negative;
+    otherwise the step's own status (inconclusive or error), so a negative is never hidden
+    inside a vulnerable step. An attack whose step is absent from ``results`` reads "not run".
     """
     by_key = {result.key: result for result in results}
     rows: list[CoverageRow] = []
@@ -816,7 +834,7 @@ def coverage(results: Sequence[StepResult], steps: Sequence[Step] = STEPS) -> li
                 if ids:
                     outcome = ", ".join(ids)
                 elif result.status in _COMPLETED:
-                    outcome = _NO_FINDING
+                    outcome = Status.INCONCLUSIVE.value if result.capped else _NO_FINDING
                 else:
                     outcome = result.status.value
             rows.append(CoverageRow(attack, step.key, outcome, ids, attack_map.MAPPINGS[attack]))
@@ -926,6 +944,7 @@ def _step_dict(result: StepResult) -> dict[str, object]:
         "method": result.method,
         "duration_s": result.duration_s,
         "finding_ids": [finding.id for finding in result.findings],
+        "capped": list(result.capped),
     }
 
 

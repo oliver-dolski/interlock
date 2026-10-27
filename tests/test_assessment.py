@@ -914,7 +914,7 @@ def test_weak_key_keyset_clean_bus_with_a_long_tail_is_not_vulnerable(lab_dir: P
     [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
     assert result.status is Status.NOT_VULNERABLE, result.detail
     assert result.findings == ()
-    assert "cap" not in result.detail
+    assert "frame cap" not in result.detail
     assert result.capped == ()
 
 
