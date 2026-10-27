@@ -143,12 +143,24 @@ _SNIFF_OVERRIDES = ("docker-compose.tap.yml",)
 
 Frames = list[tuple[Direction, OsdpFrame]]
 
+_DIRECTION_LABEL: dict[Direction, str] = {
+    Direction.cp_to_pd: "cp->pd",
+    Direction.pd_to_cp: "pd->cp",
+}
+
+
+def _decode_direction(direction: Direction, data: bytes, *, max_frames: int) -> Frames:
+    """Decode one direction's capture on its own, under its own ``max_frames`` cap."""
+    return decode_chunks([(direction, data)], max_frames=max_frames)
+
 
 def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> tuple[Frames, int]:
     """Gate on a full session, read both per-direction captures and decode them.
 
-    Returns the decoded frames and the number of captured bytes. Raises ``Inconclusive``
-    when the PD never came online, no card-read event was seen or a capture is empty.
+    Each direction is decoded under its own ``max_frames`` cap, so a long cp->pd capture (the
+    CP polls until the capture is read) can never starve the pd->cp half. Returns the decoded
+    frames, cp->pd first, and the number of captured bytes. Raises ``Inconclusive`` when the
+    PD never came online, no card-read event was seen or a capture is empty.
     """
     _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
     _require_log(lab, EVENT_RECEIVED, _EVENT_TIMEOUT, "card-read event")
@@ -158,9 +170,10 @@ def _capture_session(lab: lab_session.LabHandle, *, max_frames: int = 200) -> tu
         raise Inconclusive("the cp->pd tap capture is empty")
     if not pd2cp:
         raise Inconclusive("the pd->cp tap capture is empty")
-    frames = decode_chunks(
-        [(Direction.cp_to_pd, cp2pd), (Direction.pd_to_cp, pd2cp)], max_frames=max_frames
-    )
+    frames = [
+        *_decode_direction(Direction.cp_to_pd, cp2pd, max_frames=max_frames),
+        *_decode_direction(Direction.pd_to_cp, pd2cp, max_frames=max_frames),
+    ]
     return frames, len(cp2pd) + len(pd2cp)
 
 
@@ -266,7 +279,7 @@ def _fuzz(session: LabSession, context: dict[str, object]) -> StepOutput:
 # weak-key-keyset: the install-mode sc-scbkd lab under the read-only tap.
 _WEAK_KEY_PROFILE = "sc-scbkd"
 _WEAK_KEY_OVERRIDES = ("docker-compose.tap.yml",)
-# The default 200 can stop decoding before CMD_KEYSET on the install-mode bus.
+# The frame cap is per direction; 400 keeps CMD_KEYSET in reach on the install-mode bus.
 _WEAK_KEY_MAX_FRAMES = 400
 
 
