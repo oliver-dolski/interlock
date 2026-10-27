@@ -418,6 +418,8 @@ def test_preflight_no_lab_dir_found_exits_2_without_reports(
     md_path = tmp_path / "out" / "assessment.md"
     result = runner.invoke(app, ["osdp", "assess", "-o", str(md_path)])
     assert result.exit_code == 2, result.output
+    # The lab is not in the wheel (D-02): a pip-installed user is told where it lives.
+    assert "clone" in result.stderr
     assert "--lab-dir" in result.stderr
     _assert_nothing_written(tmp_path, fake)
 

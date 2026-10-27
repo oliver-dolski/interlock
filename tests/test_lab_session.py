@@ -316,6 +316,31 @@ def test_reset_runs_one_down_and_ignores_a_non_zero_exit(tmp_path: Path) -> None
     assert runner.argvs == [[*_base(tmp_path), "down", "-v"]]
 
 
+def test_inherited_topology_variables_never_reach_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A shell left with these would reroute the lab: the cp straight to the pd, or the
+    # attacker to a host outside it (WR-03). DOCKER_HOST must survive: it picks the Docker.
+    monkeypatch.setenv("CP_UPSTREAM", "pd:10000")
+    monkeypatch.setenv("ATTACKER_UPSTREAM", "evil:1")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/d.sock")
+    runner = _Runner(stdout={"config": "{}"})
+    session = _session(tmp_path, runner)
+
+    session.reset()
+    session.check_containment(("docker-compose.spoof.yml",))
+    with session.scenario("sc-scbkd", ("docker-compose.tap.yml",)) as lab:
+        lab.logs("cp")
+        assert lab.env["CP_UPSTREAM"] == "attacker:10000"
+
+    assert [_subcommand(argv) for argv in runner.argvs] == ["down", "config", "up", "logs", "down"]
+    for argv, env in runner.calls:
+        assert env["CP_UPSTREAM"] == "attacker:10000", argv
+        assert env["ATTACKER_UPSTREAM"] == "pd:10000", argv
+        assert env["DOCKER_HOST"] == "unix:///tmp/d.sock", argv
+    assert [env["LAB_SCENARIO"] for _, env in runner.calls[2:]] == ["sc-scbkd"] * 3
+
+
 def test_find_lab_dir_returns_the_first_ancestor_with_both_compose_files(
     tmp_path: Path,
 ) -> None:
@@ -368,6 +393,9 @@ def test_make_runner_runs_a_list_argv_from_the_lab_dir_without_a_shell(
     assert kwargs["env"] == env
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
+    # Docker prints UTF-8; the platform default (cp1252 on Windows) must not decide.
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
     assert kwargs["check"] is False
     assert not kwargs.get("shell")
 
