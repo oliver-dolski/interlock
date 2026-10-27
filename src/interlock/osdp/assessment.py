@@ -40,7 +40,7 @@ from rich.table import Table
 
 import interlock
 from interlock import report
-from interlock.osdp import attack_map, constants, lab_session, secure_channel
+from interlock.osdp import attack_map, lab_session, secure_channel
 from interlock.osdp.attacks import downgrade, replay, spoof
 from interlock.osdp.attacks.enumerate import run_enumerate
 from interlock.osdp.attacks.fuzz import LIBOSDP_REJECTION_MARKERS
@@ -339,14 +339,17 @@ def _weak_key_keyset(session: LabSession, context: dict[str, object]) -> StepOut
     with session.scenario(_WEAK_KEY_PROFILE, _WEAK_KEY_OVERRIDES) as lab:
         capture = _capture_session(lab, max_frames=_WEAK_KEY_MAX_FRAMES)
     frames = capture.frames
-    cp_codes = {frame.code for direction, frame in frames if direction is Direction.cp_to_pd}
-    pd_codes = {frame.code for direction, frame in frames if direction is Direction.pd_to_cp}
-    if constants.CMD_CHLNG not in cp_codes:
+    # The gates use the verdicts' own parsers, so a passed gate means the verdict has input.
+    rnd_as = [
+        rnd_a for d, f in frames if (rnd_a := secure_channel.challenge_random(d, f)) is not None
+    ]
+    replies = [reply for d, f in frames if (reply := secure_channel.ccrypt_reply(d, f)) is not None]
+    if not rnd_as:
         raise Inconclusive(
             "no Secure Channel handshake captured (no CMD_CHLNG cp->pd), so neither the key "
             "check nor the KEYSET decryption had anything to work on"
         )
-    if constants.REPLY_CCRYPT not in pd_codes:
+    if not replies:
         raise Inconclusive(
             "no REPLY_CCRYPT pd->cp captured (the PD half of the Secure Channel handshake), so "
             "no key verdict is possible"
