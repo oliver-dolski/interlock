@@ -799,7 +799,16 @@ def test_weak_key_keyset_with_an_empty_capture_is_inconclusive(
     assert "empty" in result.detail
 
 
-def test_weak_key_keyset_decodes_up_to_400_frames(
+@pytest.fixture
+def weak_key_cap_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore the old 400-frame weak-key cap, so the cap tests stay cheap to reach.
+
+    The step reads ``_WEAK_KEY_MAX_FRAMES`` at call time, so the patch reaches the real step.
+    """
+    monkeypatch.setattr(assessment, "_WEAK_KEY_MAX_FRAMES", 400)
+
+
+def test_weak_key_keyset_decodes_each_direction_up_to_the_ceiling(
     lab_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[tuple[tuple[Direction, ...], int]] = []
@@ -814,9 +823,10 @@ def test_weak_key_keyset_decodes_up_to_400_frames(
     [result] = _run_steps(lab_dir, FakeCompose(), "weak-key-keyset")
     assert result.status is Status.VULNERABLE
     # One call per direction, each under its own cap: a long cp->pd never starves pd->cp.
-    assert seen == [((Direction.cp_to_pd,), 400), ((Direction.pd_to_cp,), 400)]
+    assert seen == [((Direction.cp_to_pd,), 20000), ((Direction.pd_to_cp,), 20000)]
 
 
+@pytest.mark.usefixtures("weak_key_cap_400")
 def test_weak_key_keyset_with_cp_to_pd_past_the_cap_still_sees_the_pd_handshake(
     lab_dir: Path,
 ) -> None:
@@ -894,6 +904,26 @@ def test_weak_key_keyset_on_a_non_default_key_bus_is_not_vulnerable(lab_dir: Pat
     assert result.findings == ()
 
 
+def test_weak_key_keyset_clean_bus_with_a_long_tail_is_not_vulnerable(lab_dir: Path) -> None:
+    # A slow host reads the capture late, so polls and acks pile up behind the handshake; under
+    # the real ceiling that tail is decoded in full and the clean verdict stands.
+    pair = _fixture_pair("downgrade")
+    pair["cp2pd.cap"] = _with_trailing(pair["cp2pd.cap"], constants.CMD_POLL, _PAST_WEAK_KEY_CAP)
+    pair["pd2cp.cap"] = _with_trailing(pair["pd2cp.cap"], constants.REPLY_ACK, _PAST_WEAK_KEY_CAP)
+    fake = FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair})
+    [result] = _run_steps(lab_dir, fake, "weak-key-keyset")
+    assert result.status is Status.NOT_VULNERABLE, result.detail
+    assert result.findings == ()
+    assert "cap" not in result.detail
+    assert result.capped == ()
+
+
+def test_weak_key_keyset_method_names_the_frame_ceiling() -> None:
+    [weak] = _steps("weak-key-keyset")
+    assert "20000" in weak.method
+
+
+@pytest.mark.usefixtures("weak_key_cap_400")
 @pytest.mark.parametrize(
     ("basename", "code", "label"),
     [
@@ -915,6 +945,7 @@ def test_weak_key_keyset_without_a_match_past_the_frame_cap_is_inconclusive(
     assert result.findings == ()
 
 
+@pytest.mark.usefixtures("weak_key_cap_400")
 def test_capture_detail_counts_frames_per_direction_and_names_a_reached_cap(
     lab_dir: Path,
 ) -> None:
@@ -998,7 +1029,8 @@ def _without_pdcap(capture: bytes) -> bytes:
     )
 
 
-# Trailing frame counts past each frame cap: the default 200, and weak-key-keyset's 400.
+# Trailing frame counts past each frame cap: the default 200, and the 400 that
+# ``weak_key_cap_400`` restores for weak-key-keyset (its real ceiling is far higher).
 _PAST_SNIFF_CAP = 250
 _PAST_WEAK_KEY_CAP = 450
 
@@ -1014,6 +1046,18 @@ def _with_trailing(capture: bytes, code: int, count: int) -> bytes:
     )
     assert raw is not None, f"no frame with code {code:#04x} in the capture"
     return capture + raw * count
+
+
+def _with_leading(capture: bytes, code: int, count: int) -> bytes:
+    """Return ``count`` copies of the first frame with ``code`` in ``capture``, then ``capture``.
+
+    Models a tap that started recording long before the session it is meant to see.
+    """
+    raw = next(
+        (raw for raw in framer.iter_frames(capture) if codec.decode(raw).code == code), None
+    )
+    assert raw is not None, f"no frame with code {code:#04x} in the capture"
+    return raw * count + capture
 
 
 def _with_truncated_payload(capture: bytes, code: int, keep: int) -> bytes:
@@ -1236,6 +1280,7 @@ def test_downgrade_with_long_captures_is_still_vulnerable(lab_dir: Path) -> None
     assert "ATK-03-downgrade" in _finding_ids(result)
 
 
+@pytest.mark.usefixtures("weak_key_cap_400")
 def test_weak_key_keyset_with_both_directions_past_the_cap_is_still_vulnerable(
     lab_dir: Path,
 ) -> None:
@@ -1267,6 +1312,7 @@ _LONG_CAPTURE_CASES = [
 ]
 
 
+@pytest.mark.usefixtures("weak_key_cap_400")
 @pytest.mark.parametrize(("key", "bring_up", "fixture", "padded", "count"), _LONG_CAPTURE_CASES)
 def test_a_long_capture_is_never_reported_not_vulnerable(
     lab_dir: Path,
@@ -1523,6 +1569,76 @@ def test_coverage_marks_an_attack_whose_step_never_ran() -> None:
     rows = assessment.coverage([])
     assert len(rows) == 9
     assert {row.result for row in rows} == {"not run"}
+
+
+def _step_entry(document: Mapping[str, object], key: str) -> Mapping[str, object]:
+    steps = document["steps"]
+    assert isinstance(steps, list)
+    entry = next(step for step in steps if step["key"] == key)
+    assert isinstance(entry, dict)
+    return entry
+
+
+def _coverage_entry(document: Mapping[str, object], attack: str) -> Mapping[str, object]:
+    coverage = document["coverage"]
+    assert isinstance(coverage, list)
+    entry = next(entry for entry in coverage if entry["attack"] == attack)
+    assert isinstance(entry, dict)
+    return entry
+
+
+@pytest.mark.usefixtures("weak_key_cap_400")
+def test_coverage_reads_inconclusive_for_keyset_cut_by_the_cap(
+    tmp_path: Path, lab_dir: Path
+) -> None:
+    cap = 400
+    pair = _fixture_pair("keyset")
+    cp_raws = list(framer.iter_frames(pair["cp2pd.cap"]))
+    cp_codes = [codec.decode(raw).code for raw in cp_raws]
+    pd_codes = [codec.decode(raw).code for raw in framer.iter_frames(pair["pd2cp.cap"])]
+    chlng = cp_codes.index(constants.CMD_CHLNG)
+    keyset = cp_codes.index(constants.CMD_KEYSET)
+    ccrypt = pd_codes.index(constants.REPLY_CCRYPT)
+    # Polls between the handshake and the KEYSET push the KEYSET past the cap, nothing else.
+    poll = next(raw for raw, code in zip(cp_raws, cp_codes) if code == constants.CMD_POLL)
+    pair["cp2pd.cap"] = b"".join([*cp_raws[:keyset], poll * cap, *cp_raws[keyset:]])
+    assert chlng < keyset < cap <= keyset + cap
+    assert ccrypt < len(pd_codes) < cap
+
+    markdown, document = _full_run(
+        lab_dir, FakeCompose(bring_up_captures={("sc-scbkd", _TAP): pair}), tmp_path / "out"
+    )
+    rows = _coverage_rows(markdown)
+    assert rows["weak-key"][2] == "ATK-06-weak-key"
+    assert rows["keyset"][2] == "inconclusive"
+    entry = _step_entry(document, "weak-key-keyset")
+    assert entry["status"] == "vulnerable"
+    assert entry["finding_ids"] == ["ATK-06-weak-key"]
+    assert entry["capped"] == ["cp->pd"]
+    keyset_entry = _coverage_entry(document, "keyset")
+    assert keyset_entry["result"] == "inconclusive" and keyset_entry["finding_ids"] == []
+    # An uncapped completed step without a finding still reads "no finding".
+    assert rows["fuzz"][2] == "no finding"
+    assert _step_entry(document, "fuzz")["capped"] == []
+
+
+def test_coverage_reads_inconclusive_for_enumerate_cut_by_the_cap(
+    tmp_path: Path, lab_dir: Path
+) -> None:
+    # A tap that recorded 200 acks before the session: the PDID and PDCAP replies lie past the
+    # default 200-frame cap, so enumerate saw nothing it could call clean.
+    pair = _fixture_pair("cleartext")
+    pair["pd2cp.cap"] = _with_leading(pair["pd2cp.cap"], constants.REPLY_ACK, 200)
+    markdown, document = _full_run(lab_dir, FakeCompose(captures=pair), tmp_path / "out")
+    entry = _step_entry(document, "sniff-enumerate")
+    assert entry["status"] == "vulnerable"
+    assert "ATK-01-sniff-pd-101" in entry["finding_ids"]
+    assert not [fid for fid in entry["finding_ids"] if fid.startswith("ATK-02-")]
+    assert entry["capped"] == ["pd->cp"]
+    rows = _coverage_rows(markdown)
+    assert rows["sniff"][2] == "ATK-01-sniff-pd-101"
+    assert rows["enumerate"][2] == "inconclusive"
+    assert _coverage_entry(document, "enumerate")["result"] == "inconclusive"
 
 
 # Full-report shape (ASSESS-02) and size and content bounds (T-05-20). ------------------------
