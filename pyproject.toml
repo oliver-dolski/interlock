@@ -69,8 +69,11 @@ demo = "interlock.plugins.demo:DemoPlugin"
 [project.entry-points."interlock.commands"]
 osdp = "interlock.osdp.attacks:build_osdp_app"
 
+# Dotfiles (tool and editor dirs, local notes) and bytecode never ship, at any depth. Hatchling
+# still adds the root .gitignore to the sdist on its own; scripts/check_dist.py allows only that.
 [tool.hatch.build.targets.wheel]
 packages = ["src/interlock"]
+exclude = ["__pycache__", "*.pyc", "*.pyo", ".*"]
 
 # hatchling honours .gitignore but not .git/info/exclude, so the sdist names what it carries
 # instead of trusting the tree. scripts/check_dist.py enforces the same list on the archive.
@@ -97,7 +100,7 @@ only-include = [
     "NOTICE",
     "pyproject.toml",
 ]
-exclude = ["docs/media", "__pycache__"]
+exclude = ["docs/media", "__pycache__", "*.pyc", "*.pyo", ".*"]
 
 [tool.ruff]
 line-length = 100
