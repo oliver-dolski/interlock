@@ -3,7 +3,8 @@
 The CLI builds its command groups at import, so one POSIX-only module imported at module
 scope anywhere under the osdp group takes the whole CLI down on Windows, and with it every
 CLI test and the collection of tests/lab. These tests run the CLI in a fresh interpreter
-with the POSIX terminal modules blocked, which is the shape of the Windows stdlib.
+with the POSIX terminal modules blocked, which is the shape of the Windows stdlib. A static
+scan also keeps the tests from joining a host path with a '/' literal, which only Windows sees.
 """
 
 from __future__ import annotations
@@ -137,3 +138,47 @@ def test_only_the_pty_select_tests_skip_on_windows() -> None:
                     if _is_win32_skipif(value):
                         found.add((path.relative_to(_REPO).as_posix(), value.lineno))
     assert found == _WIN32_SKIPPED
+
+
+# A POSIX host builds the same string from f"{path}/name" and str(path / "name"), so only the
+# source shows the separator that breaks the test on Windows before a Windows run does.
+def _slash_joined_path_params(source: str) -> list[int]:
+    lines: set[int] = set()
+    for func in ast.walk(ast.parse(source)):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        args = func.args
+        params = {
+            arg.arg
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+            if arg.annotation is not None and ast.unparse(arg.annotation) == "Path"
+        }
+        for node in ast.walk(func):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            for value, after in zip(node.values, node.values[1:], strict=False):
+                if (
+                    isinstance(value, ast.FormattedValue)
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id in params
+                    and isinstance(after, ast.Constant)
+                    and isinstance(after.value, str)
+                    and after.value.startswith(("/", "\\"))
+                ):
+                    lines.add(node.lineno)
+    return sorted(lines)
+
+
+def test_no_test_builds_a_host_path_with_a_slash_literal() -> None:
+    offenders = [
+        f"{path.relative_to(_REPO).as_posix()}:{line}"
+        for path in sorted((_REPO / "tests").rglob("*.py"))
+        for line in _slash_joined_path_params(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []
+
+
+def test_slash_literal_scan_flags_a_planted_join() -> None:
+    head = "from pathlib import Path\n\n\ndef build(tmp_path: Path) -> str:\n    return "
+    assert _slash_joined_path_params(head + 'f"{tmp_path}/a"\n') == [5]
+    assert _slash_joined_path_params(head + 'str(tmp_path / "a")\n') == []

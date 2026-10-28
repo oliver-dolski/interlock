@@ -266,6 +266,19 @@ def _overrides(argv: Sequence[str]) -> tuple[str, ...]:
     return tuple(files[1:])
 
 
+def _windows_compose_paths(argv: Sequence[str]) -> list[str]:
+    """Return a copy of a compose argv with every -f path in Windows form.
+
+    Each path keeps all its segments and trades its host anchor for a drive letter, so the
+    result is the same on macOS, Linux and Windows.
+    """
+    rewritten = list(argv)
+    for i, token in enumerate(argv[:-1]):
+        if token == "-f":
+            rewritten[i + 1] = str(PureWindowsPath("C:/", *Path(argv[i + 1]).parts[1:]))
+    return rewritten
+
+
 def _bring_ups(fake: FakeCompose) -> list[tuple[str, tuple[str, ...]]]:
     """Return (LAB_SCENARIO, overrides) for every ``up`` the fake saw, in order."""
     return [
@@ -371,6 +384,48 @@ def test_assess_runs_every_step_end_to_end(
         if _subcommand(argv) == "exec"
     ]
     assert reads == ["/app/capture/cp2pd.cap", "/app/capture/pd2cp.cap"]
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        PurePosixPath("/tmp/pytest-of-runner/pytest-0/lab"),
+        PureWindowsPath(r"C:\Windows\Temp\pytest-of-runner\pytest-0\lab"),
+    ],
+    ids=["posix", "windows"],
+)
+def test_overrides_reads_the_name_of_either_path_form(
+    root: PurePosixPath | PureWindowsPath,
+) -> None:
+    argv = [
+        "docker", "compose", "-p", "interlock-assess",
+        "-f", str(root / "docker-compose.yml"), "-f", str(root / _TAP),
+        "up", "-d",
+    ]
+    assert _overrides(argv) == (_TAP,)
+
+
+def test_healthy_lab_reads_the_same_through_windows_compose_paths(lab_dir: Path) -> None:
+    """LabSession passes native paths, so on Windows the fake sees drive-letter paths.
+
+    This run hands the fake those paths on any host, so a fake that reads only the POSIX form
+    fails on the Mac and on Linux CI instead of first on a Windows machine.
+    """
+    fake = FakeCompose()
+    clock = FakeClock()
+
+    def runner(
+        argv: Sequence[str], env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        return fake(_windows_compose_paths(argv), env)
+
+    session = LabSession(lab_dir, runner=runner, sleep=clock.sleep, clock=clock)
+    results = run_assessment(session, clock=clock)
+    assert {r.key: r.status.value for r in results} == _HEALTHY_LAB_STATUSES
+    assert _bring_ups(fake) == _HEALTHY_LAB_BRING_UPS
+    paths = [argv[i + 1] for argv in fake.argvs for i, token in enumerate(argv) if token == "-f"]
+    assert paths
+    assert all("\\" in path and "/" not in path for path in paths), paths
 
 
 def test_assess_help_is_lab_only() -> None:
