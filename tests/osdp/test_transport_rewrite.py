@@ -159,7 +159,9 @@ class _BrokenDestination:
         raise BrokenPipeError("peer gone")
 
 
-def _forwards(dst: object, transform: Callable[[Direction, bytes], bytes]) -> list[tuple[object, ...]]:
+def _forwards(
+    dst: object, transform: Callable[[Direction, bytes], bytes]
+) -> list[tuple[object, ...]]:
     """Run ``_pump_socket_rewrite`` into ``dst`` and return every ``on_forward`` report."""
     reports: list[tuple[object, ...]] = []
     src_feed, src = socket.socketpair()

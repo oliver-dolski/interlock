@@ -330,10 +330,10 @@ def containment_violations(config: Mapping[str, object], lab_dir: Path) -> list[
     ``lab_dir`` is the directory of the base compose file: bind sources and build contexts
     must resolve inside it. A network or named volume may only carry the name compose derives
     from the top-level project ``name``. Deny by default: a top-level section, service, network
-    or volume key outside its allow-list is a violation. Pure and total: a missing or malformed section
-    is itself a violation, never an exception. Each text names the section, network, volume
-    or service and the key, never a value, so no host path from the resolved config (a bind
-    source, a build context) can reach a message or a report.
+    or volume key outside its allow-list is a violation. Pure and total: a missing or malformed
+    section is itself a violation, never an exception. Each text names the section, network,
+    volume or service and the key, never a value, so no host path from the resolved config (a
+    bind source, a build context) can reach a message or a report.
     """
     lab = Path(lab_dir).resolve()
     violations = [
