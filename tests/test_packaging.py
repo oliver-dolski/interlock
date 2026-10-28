@@ -246,6 +246,108 @@ def test_gate_rejects_docs_media(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert "docs/media/demo.gif" in captured.out + captured.err
 
 
+# A file the tree hides only through an ignore or exclude list, which the build does not read,
+# can sit at any depth under a root the sdist carries (WR-03). The gate names none of them: it
+# refuses every member git does not track, and every dotfile, __pycache__ dir and bytecode
+# file by its shape, tracked or not.
+_TRACKED_CLEAN = frozenset(
+    {member for member in _CLEAN_SDIST if member != "PKG-INFO"}
+    | {f"src/{member}" for member in _CLEAN_WHEEL if member.startswith("interlock/")}
+)
+
+
+def _gate(monkeypatch: pytest.MonkeyPatch, tracked: frozenset[str] | None) -> Any:
+    """Return the gate module with ``tracked`` standing in for ``git ls-files``."""
+    gate = _check_dist()
+    monkeypatch.setattr(gate, "tracked_files", lambda repo: tracked)
+    return gate
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["tests/NOTES.md", "docs/examples/notes/plan.md", "lab/osdp/STATE.md", "src/interlock/x.py"],
+)
+def test_gate_rejects_an_sdist_member_git_does_not_track(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], member: str
+) -> None:
+    dist = _dist_dir(tmp_path, sdist=[*_CLEAN_SDIST, member])
+    assert _gate(monkeypatch, _TRACKED_CLEAN).main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert member in captured.err
+    assert "check_dist: ok" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "tests/.tool/settings.json",
+        "lab/.state/STATE.md",
+        "docs/examples/x/__pycache__/a.cpython-311.pyc",
+        "src/interlock/stale.pyc",
+        "src/interlock/stale.pyo",
+        "src/interlock/.idea/workspace.xml",
+        "docs/.notes",
+        "tests/.gitignore",
+    ],
+)
+def test_gate_rejects_dotfiles_and_bytecode_in_the_sdist_even_when_tracked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], member: str
+) -> None:
+    dist = _dist_dir(tmp_path, sdist=[*_CLEAN_SDIST, member])
+    assert _gate(monkeypatch, _TRACKED_CLEAN | {member}).main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert member in captured.err
+    assert "check_dist: ok" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "interlock/NOTES.md",
+        "interlock/.tool/settings.json",
+        "interlock/__pycache__/cli.cpython-311.pyc",
+        "interlock/stale.pyc",
+    ],
+)
+def test_gate_rejects_an_untracked_or_generated_file_in_the_wheel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], member: str
+) -> None:
+    dist = _dist_dir(tmp_path, wheel=[*_CLEAN_WHEEL, member])
+    # Tracked or not, a dotfile or bytecode fails by shape; NOTES.md fails as untracked.
+    tracked = _TRACKED_CLEAN | ({f"src/{member}"} if member != "interlock/NOTES.md" else set())
+    assert _gate(monkeypatch, tracked).main([str(dist)]) == 1
+    assert member in capsys.readouterr().err
+
+
+def test_gate_passes_a_clean_dist_whose_members_git_tracks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _gate(monkeypatch, _TRACKED_CLEAN).main([str(_dist_dir(tmp_path))]) == 0
+    assert "check_dist: ok" in capsys.readouterr().out
+
+
+def test_gate_fails_closed_when_git_cannot_list_tracked_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _gate(monkeypatch, None).main([str(_dist_dir(tmp_path))]) == 1
+    captured = capsys.readouterr()
+    assert "tracked" in captured.err
+    assert "check_dist: ok" not in captured.out
+
+
+def test_gate_reads_the_tracked_files_of_this_checkout() -> None:
+    tracked = _check_dist().tracked_files(REPO_ROOT)
+    assert tracked is not None
+    assert {"pyproject.toml", "scripts/check_dist.py", "src/interlock/__init__.py"} <= tracked
+
+
+def test_build_excludes_dotfiles_and_bytecode_from_both_archives() -> None:
+    targets = _project()["tool"]["hatch"]["build"]["targets"]
+    expected = {"__pycache__", "*.pyc", "*.pyo", ".*"}
+    for target in ("sdist", "wheel"):
+        assert expected <= set(targets[target].get("exclude", [])), target
+
+
 def test_gate_requires_notice_at_the_sdist_root(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
