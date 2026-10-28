@@ -67,3 +67,53 @@ def test_unit_job_covers_both_platforms_and_python_versions() -> None:
         '-m "not lab"',
     ):
         assert needle in unit, needle
+
+
+def test_all_jobs_exist() -> None:
+    assert set(job_blocks()) == {"lint", "type", "unit", "build", "lab-smoke", "lab-full"}
+
+
+def test_lab_jobs_run_on_ubuntu_only() -> None:
+    blocks = job_blocks()
+    for name, block in blocks.items():
+        if name != "unit":
+            assert "windows-latest" not in block, name
+    for name in ("lab-smoke", "lab-full"):
+        assert re.search(r"^    runs-on: ubuntu-latest$", blocks[name], re.MULTILINE), name
+
+
+def test_lab_smoke_runs_the_assessment_and_checks_the_notice() -> None:
+    smoke = job_blocks()["lab-smoke"]
+    for needle in (
+        "python -m pip install .\n",
+        "interlock osdp assess",
+        "AUTHORIZED_USE_NOTICE",
+        "doc['notice']",
+        "actions/upload-artifact@",
+        "if: always()",
+        "timeout-minutes:",
+    ):
+        assert needle in smoke + "\n", needle
+
+
+def test_full_lab_runs_only_on_dispatch() -> None:
+    full = job_blocks()["lab-full"]
+    assert "if: github.event_name == 'workflow_dispatch'" in full
+    assert re.search(r"pytest -q -m lab\s*$", full, re.MULTILINE)
+
+
+def test_build_job_gates_the_dists() -> None:
+    build = job_blocks()["build"]
+    for needle in ("python -m build", "python scripts/check_dist.py dist", "twine check --strict"):
+        assert needle in build, needle
+
+
+def test_lint_and_type_jobs() -> None:
+    blocks = job_blocks()
+    assert "ruff check src tests scripts" in blocks["lint"]
+    assert "mypy src" in blocks["type"]
+
+
+def test_no_format_check_step() -> None:
+    steps = [line for line in workflow_text().splitlines() if not line.lstrip().startswith("#")]
+    assert not any("ruff format" in line for line in steps)
