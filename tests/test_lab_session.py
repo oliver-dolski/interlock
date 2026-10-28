@@ -149,8 +149,8 @@ def test_cleartext_tap_scenario_end_to_end(tmp_path: Path) -> None:
     assert DEFAULT_PROJECT == "interlock-assess"
     assert runner.argvs[0] == [
         "docker", "compose", "-p", "interlock-assess",
-        "-f", f"{tmp_path}/docker-compose.yml",
-        "-f", f"{tmp_path}/docker-compose.tap.yml",
+        "-f", str(tmp_path / "docker-compose.yml"),
+        "-f", str(tmp_path / "docker-compose.tap.yml"),
         "up", "-d", "--build", "--force-recreate",
     ]
     assert runner.argvs[1:-1] == [
