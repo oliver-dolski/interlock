@@ -261,7 +261,18 @@ def _service_violations(
     return violations
 
 
-def _network_violations(name: object, network: object) -> list[str]:
+def _foreign_name(name: object, node: Mapping[object, object], project: str | None) -> bool:
+    """Return True when ``node`` is named onto anything but the name compose derives for it.
+
+    Compose creates a network or named volume as ``{project}_{key}``; any other ``name`` points
+    at an object it may not have created (an existing network, a volume bound to a host path),
+    which it joins or mounts as found. Without a project the name cannot be checked, and the
+    top-level ``name`` violation already says so.
+    """
+    return project is not None and "name" in node and node["name"] != f"{project}_{name}"
+
+
+def _network_violations(name: object, network: object, project: str | None) -> list[str]:
     """Return the violations of one top-level network: internal, a plain bridge, nothing else."""
     if not isinstance(network, Mapping) or network.get("internal") is not True:
         return [f"network {name}: internal is not true"]
@@ -272,10 +283,12 @@ def _network_violations(name: object, network: object) -> list[str]:
     ]
     if network.get("driver", "bridge") != "bridge":
         violations.append(f"network {name}: driver is not bridge")
+    if _foreign_name(name, network, project):
+        violations.append(f"network {name}: name is not the one compose derives")
     return violations
 
 
-def _named_volume_violations(volumes: object) -> list[str]:
+def _named_volume_violations(volumes: object, project: str | None) -> list[str]:
     """Return the violations of the top-level named volumes: plain local volumes only."""
     if not isinstance(volumes, Mapping):
         return ["volumes: not a mapping"]
@@ -291,6 +304,8 @@ def _named_volume_violations(volumes: object) -> list[str]:
             for key in volume
             if key not in _VOLUME_KEYS
         ]
+        if _foreign_name(name, volume, project):
+            violations.append(f"volume {name}: name is not the one compose derives")
     return violations
 
 
@@ -298,8 +313,9 @@ def containment_violations(config: Mapping[str, object], lab_dir: Path) -> list[
     """Return every containment rule a resolved ``docker compose config`` document breaks.
 
     ``lab_dir`` is the directory of the base compose file: bind sources and build contexts
-    must resolve inside it. Deny by default: a top-level section, service, network or volume
-    key outside its allow-list is a violation. Pure and total: a missing or malformed section
+    must resolve inside it. A network or named volume may only carry the name compose derives
+    from the top-level project ``name``. Deny by default: a top-level section, service, network
+    or volume key outside its allow-list is a violation. Pure and total: a missing or malformed section
     is itself a violation, never an exception. Each text names the section, network, volume
     or service and the key, never a value, so no host path from the resolved config (a bind
     source, a build context) can reach a message or a report.
@@ -310,14 +326,19 @@ def containment_violations(config: Mapping[str, object], lab_dir: Path) -> list[
         for key in config
         if key not in _TOP_LEVEL_KEYS
     ]
+    project = config.get("name")
+    if not isinstance(project, str) or not project:
+        project = None
+        violations.append("name: missing or not a string, so network and volume names "
+                          "cannot be checked")
     networks = config.get("networks")
     if not isinstance(networks, Mapping):
         violations.append("networks: missing or not a mapping")
     else:
         for name, network in networks.items():
-            violations += _network_violations(name, network)
+            violations += _network_violations(name, network, project)
     if "volumes" in config:
-        violations += _named_volume_violations(config["volumes"])
+        violations += _named_volume_violations(config["volumes"], project)
     services = config.get("services")
     if not isinstance(services, Mapping):
         violations.append("services: missing or not a mapping")
