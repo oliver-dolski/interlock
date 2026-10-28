@@ -65,7 +65,31 @@ _PINNED_TOPOLOGY = {"CP_UPSTREAM": "attacker:10000", "ATTACKER_UPSTREAM": "pd:10
 
 # What the preflight proves of every resolved compose file set before anything runs (WR-07).
 # The report's Containment line names exactly these, so it never claims an unchecked rule.
-CONTAINMENT_RULES: tuple[str, ...] = ("every network internal", "no published ports")
+CONTAINMENT_RULES: tuple[str, ...] = (
+    "every network internal",
+    "no published ports",
+    "no exposed ports",
+    "no devices",
+    "not privileged",
+    "no network_mode",
+    "no added capabilities",
+    "no host pid or ipc namespace",
+)
+
+# Service keys that reach past the lab when set to any truthy value, with the reason a
+# violation gives. ``ports`` publishes to the host; the others hand a container host devices,
+# privileges, capabilities or namespaces. A falsy value (privileged: false, cap_add: []) is
+# what compose resolves for "not set", so it is no violation.
+_ESCAPE_KEYS: tuple[tuple[str, str], ...] = (
+    ("ports", "publishes a port to the host"),
+    ("expose", "exposes a port"),
+    ("devices", "attaches a host device"),
+    ("privileged", "runs privileged"),
+    ("network_mode", "leaves the lab network"),
+    ("cap_add", "adds capabilities"),
+    ("pid", "joins a foreign pid namespace"),
+    ("ipc", "joins a foreign ipc namespace"),
+)
 
 # Upper bound on the stderr carried into a LabError, so a noisy build cannot flood a report.
 _STDERR_TAIL = 2000
@@ -135,8 +159,10 @@ def containment_violations(config: Mapping[str, object]) -> list[str]:
         for name, service in services.items():
             if not isinstance(service, Mapping):
                 violations.append(f"service {name}: not a mapping")
-            elif service.get("ports"):
-                violations.append(f"service {name}: ports publishes a port to the host")
+                continue
+            for key, reason in _ESCAPE_KEYS:
+                if service.get(key):
+                    violations.append(f"service {name}: {key} {reason}")
     return violations
 
 
