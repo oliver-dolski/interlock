@@ -883,6 +883,15 @@ def test_explicit_bridge_driver_is_contained(tmp_path: Path) -> None:
         {"context": _HOST, "dockerfile": "Dockerfile"},
         {"context": "@LAB_DIR@", "dockerfile": f"{_HOST}/Dockerfile"},
         "@LAB_DIR@",
+        # Remote contexts: compose keeps them unresolved, and joined onto the lab dir as a
+        # relative path they would resolve inside it.
+        {"context": "https://github.com/x/y.git#main", "dockerfile": "Dockerfile"},
+        {"context": "git@github.com:x/y.git", "dockerfile": "Dockerfile"},
+        {"context": "git://example.org/y.git", "dockerfile": "Dockerfile"},
+        {"context": "github.com/x/y", "dockerfile": "Dockerfile"},
+        {"context": "@LAB_DIR@/src#main", "dockerfile": "Dockerfile"},
+        # compose prints a local context absolute; anything relative is not its output.
+        {"context": "src", "dockerfile": "Dockerfile"},
     ],
 )
 def test_build_beyond_a_plain_lab_dir_build_is_a_containment_violation(
