@@ -48,6 +48,9 @@ dev = [
     "pytest>=8",
     "ruff>=0.5",
     "mypy>=1.10",
+    # Build the sdist and wheel and check their metadata; development and CI only.
+    "build>=1.2",
+    "twine>=6.1",
 ]
 
 [project.urls]
@@ -68,6 +71,33 @@ osdp = "interlock.osdp.attacks:build_osdp_app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/interlock"]
+
+# hatchling honours .gitignore but not .git/info/exclude, so the sdist names what it carries
+# instead of trusting the tree. scripts/check_dist.py enforces the same list on the archive.
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src/interlock",
+    "tests",
+    "lab",
+    "docs",
+    "Dockerfile",
+    "Dockerfile.vuln",
+    "lab.sh",
+    "docker-compose.yml",
+    "docker-compose.tap.yml",
+    "docker-compose.fuzz.yml",
+    "docker-compose.downgrade.yml",
+    "docker-compose.spoof.yml",
+    "docker-compose.replay.yml",
+    "docker-compose.cve.yml",
+    "docker-compose.vuln.yml",
+    "docker-compose.lockstate.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+]
+exclude = ["docs/media", "__pycache__"]
 
 [tool.ruff]
 line-length = 100
