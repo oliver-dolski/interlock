@@ -43,6 +43,7 @@ from interlock.osdp.assessment import (
     Step,
     StepOutput,
     StepResult,
+    coverage,
     exit_code,
     required_files,
     run_assessment,
@@ -572,6 +573,47 @@ def test_exit_code_is_1_only_when_a_step_did_not_complete(
     statuses: tuple[Status, ...], expected: int
 ) -> None:
     assert exit_code([_result(status) for status in statuses]) == expected
+
+
+def _clean_but_capped(session: LabSession, context: dict[str, object]) -> StepOutput:
+    return StepOutput(
+        findings=(),
+        detail="200 cp->pd frames decoded; decoding stopped at the 200-frame cap in cp->pd",
+        capped=("cp->pd",),
+    )
+
+
+def test_a_step_without_a_finding_on_a_capped_capture_is_inconclusive(lab_dir: Path) -> None:
+    # A clean verdict never rests on a capture that may continue past the cap (WR-05): the step
+    # table, the coverage table and the exit code must all say so.
+    session = LabSession(lab_dir, runner=FakeCompose())
+    results = run_assessment(session, steps=(_step("capped", _clean_but_capped),))
+    [result] = results
+    assert result.status is Status.INCONCLUSIVE
+    assert "200-frame cap" in result.detail
+    assert result.capped == ("cp->pd",)
+    assert exit_code(results) == 1
+
+
+def _enumerate_cut_by_the_cap() -> dict[str, bytes]:
+    """The cleartext pair behind 200 leading acks: PDID and PDCAP lie past the frame cap."""
+    pair = _fixture_pair("cleartext")
+    pair["pd2cp.cap"] = _with_leading(pair["pd2cp.cap"], constants.REPLY_ACK, 200)
+    return pair
+
+
+def test_exit_code_is_1_when_coverage_reads_an_attack_inconclusive(lab_dir: Path) -> None:
+    # The step is rightly vulnerable (sniff found the bus), yet enumerate was not decided.
+    cut = FakeCompose(captures=_enumerate_cut_by_the_cap())
+    capped = _run_steps(lab_dir, cut, "sniff-enumerate")
+    assert capped[0].status is Status.VULNERABLE
+    assert any(row.result == "inconclusive" for row in coverage(capped))
+    assert exit_code(capped) == 1
+
+    whole = FakeCompose(captures=_fixture_pair("cleartext"))
+    uncut = _run_steps(lab_dir, whole, "sniff-enumerate")
+    assert not any(row.result == "inconclusive" for row in coverage(uncut))
+    assert exit_code(uncut) == 0
 
 
 def test_cli_exits_1_and_still_writes_both_reports_when_a_step_is_inconclusive(
