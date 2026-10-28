@@ -25,7 +25,7 @@ import copy
 import json
 import subprocess
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -559,6 +559,30 @@ def test_malformed_config_is_a_containment_violation_not_an_exception(
     assert containment_violations(config, _LAB_DIR) != []
 
 
+@pytest.mark.parametrize("kind", [["bind"], {"x": 1}, [], {}, [None], None, 1, "BIND"])
+def test_mount_type_of_the_wrong_type_is_a_containment_violation_not_an_exception(
+    kind: object,
+) -> None:
+    volumes = [{"type": kind, "source": "/lab/src", "target": "/app/src", "read_only": True}]
+    violations = containment_violations(_planted("attacker", "volumes", volumes), _LAB_DIR)
+    assert len(violations) == 1, violations
+    assert "attacker" in violations[0] and "volumes" in violations[0]
+    assert repr(kind) not in violations[0] and "/lab/src" not in violations[0]
+
+
+@pytest.mark.parametrize("service", ["pd", "attacker", "cp"])
+@pytest.mark.parametrize("networks", [[], {}, "missing"])
+def test_service_on_no_network_is_a_containment_violation(
+    service: str, networks: object
+) -> None:
+    config = _planted(service, "networks", networks)
+    if networks == "missing":
+        del config["services"][service]["networks"]
+    violations = containment_violations(config, _LAB_DIR)
+    assert len(violations) == 1, violations
+    assert service in violations[0] and "networks" in violations[0]
+
+
 @pytest.mark.parametrize(
     ("service", "key", "value", "expected"),
     [
@@ -839,6 +863,45 @@ def test_every_bundled_compose_file_set_resolves_contained(tmp_path: Path) -> No
         runner = _Runner(stdout={"config": json.dumps(_with_lab_dir(config, lab))})
         violations = _session(lab, runner).check_containment((override,))
         assert violations == [], f"{override}: {violations}"
+
+
+# JSON values of every kind that are wrong almost anywhere in a resolved config.
+_MALFORMED: tuple[object, ...] = (
+    None, [], {}, ["bind"], {"x": 1}, [["x"]], [{"x": 1}], [None], 0, 1.5, True, "", "a\x00b",
+)
+
+
+def _node_paths(node: object, path: tuple[object, ...] = ()) -> Iterator[tuple[object, ...]]:
+    """Yield the path to every node below ``node`` (dict keys and list indexes)."""
+    if path:
+        yield path
+    if isinstance(node, dict):
+        children: Iterable[tuple[object, object]] = node.items()
+    elif isinstance(node, list):
+        children = enumerate(node)
+    else:
+        children = ()
+    for key, child in children:
+        yield from _node_paths(child, (*path, key))
+
+
+@pytest.mark.parametrize("override", sorted(ALLOWED_OVERRIDES))
+def test_containment_violations_is_total_over_every_malformed_node(
+    tmp_path: Path, override: str
+) -> None:
+    lab = _lab(tmp_path)
+    resolved = json.loads(_RESOLVED_FIXTURE.read_text(encoding="utf-8"))
+    clean = _with_lab_dir(resolved[override], lab)
+    for path in _node_paths(clean):
+        for value in _MALFORMED:
+            config = copy.deepcopy(clean)
+            parent = config
+            for key in path[:-1]:
+                parent = parent[key]
+            parent[path[-1]] = value
+            violations = containment_violations(config, lab)
+            assert isinstance(violations, list), path
+            assert all(isinstance(text, str) for text in violations), path
 
 
 def test_containment_sentence_claims_only_what_the_rules_check() -> None:
