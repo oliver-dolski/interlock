@@ -831,6 +831,10 @@ def run_assessment(
             capped = tuple(output.capped)
             if findings:
                 status, detail = Status.VULNERABLE, output.detail
+            elif capped:
+                # A clean verdict never rests on a capture that may continue past the cap.
+                status = Status.INCONCLUSIVE
+                detail = f"no finding, but the capture reached the frame cap: {output.detail}"
             else:
                 status, detail = Status.NOT_VULNERABLE, output.detail or step.clean_detail
         result = StepResult(
@@ -851,10 +855,18 @@ def run_assessment(
     return results
 
 
-def exit_code(results: Sequence[StepResult]) -> int:
-    """Return 1 when any step is inconclusive or error, else 0."""
+def exit_code(results: Sequence[StepResult], steps: Sequence[Step] = STEPS) -> int:
+    """Return 1 when any step is inconclusive or error, or any attack reads inconclusive, else 0.
+
+    A vulnerable step whose capture reached the frame cap can leave one of its attacks
+    undecided; the exit code follows the Coverage table then, so a report never says an attack
+    was not decided while the run exits 0.
+    """
     incomplete = {Status.INCONCLUSIVE, Status.ERROR}
-    return 1 if any(result.status in incomplete for result in results) else 0
+    if any(result.status in incomplete for result in results):
+        return 1
+    undecided = any(row.result == Status.INCONCLUSIVE.value for row in coverage(results, steps))
+    return 1 if undecided else 0
 
 
 def required_files(steps: Sequence[Step] = STEPS) -> tuple[str, ...]:

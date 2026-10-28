@@ -121,8 +121,8 @@ Options:
 
 Exit codes:
 
-- `0` - every assessment step completed.
-- `1` - the reports were written, but at least one step was inconclusive or failed.
+- `0` - every assessment step completed and every attack in the report was decided.
+- `1` - the reports were written, but at least one step or attack was inconclusive or failed.
 - `2` - preflight failed (no Docker, no lab directory, a missing compose file, a `.json`
   output path or a failed containment check) and nothing was written.
 

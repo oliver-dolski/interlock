@@ -12,8 +12,9 @@ file pair (the base plus one override, as each bring-up layers them) whose resol
 ``docker compose config`` breaks a ``lab_session.CONTAINMENT_RULES`` rule or cannot be
 resolved. The report's Containment line states that check, not an assumption.
 
-Exit codes: 0 when every step completed (vulnerable or not_vulnerable), 1 when the reports
-were written but a step is inconclusive or error, 2 when preflight fails.
+Exit codes: 0 when every step completed (vulnerable or not_vulnerable) and every attack in the
+Coverage table was decided, 1 when the reports were written but a step is inconclusive or
+error or an attack reads inconclusive (a capture cut at the frame cap), 2 when preflight fails.
 
 Import discipline: ``typer`` and the assessment module are imported lazily, inside
 ``register`` and the command, so the attacks package stays importable in the lab image.
