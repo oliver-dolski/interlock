@@ -1,0 +1,288 @@
+{
+  "access_vector": {
+    "enterprise": "T1200",
+    "name": "Hardware Additions"
+  },
+  "attack_version": "20.0",
+  "containment": {
+    "checked": true,
+    "detail": "checked before the run with docker compose config over docker-compose.yml plus each of 6 overrides: every network internal, no published ports, no exposed ports, no devices, not privileged, no network_mode, no added capabilities, no host pid or ipc namespace, every service on labnet only, every bind mount read-only, cp upstream pinned to the attacker, only allow-listed top-level sections and service keys, every network a plain compose-created bridge, every bind mount from inside the lab dir, every mount a bind or plain named volume or tmpfs, every build a plain build from the lab dir; so no lab container gets a host device, host privileges or namespaces, a host path outside the lab dir or any network but the internal labnet (not covered: the image build steps and the Docker daemon's own configuration)"
+  },
+  "coverage": [
+    {
+      "attack": "sniff",
+      "enterprise": "T1040",
+      "finding_ids": [
+        "ATK-01-sniff-pd-101"
+      ],
+      "ics": "T0842",
+      "result": "ATK-01-sniff-pd-101",
+      "step": "sniff-enumerate"
+    },
+    {
+      "attack": "enumerate",
+      "enterprise": "T1018",
+      "finding_ids": [
+        "ATK-02-enumerate-pd-101"
+      ],
+      "ics": "T0888",
+      "result": "ATK-02-enumerate-pd-101",
+      "step": "sniff-enumerate"
+    },
+    {
+      "attack": "fuzz",
+      "enterprise": "T1499.004",
+      "finding_ids": [],
+      "ics": "T0814",
+      "result": "no finding",
+      "step": "fuzz"
+    },
+    {
+      "attack": "weak-key",
+      "enterprise": "T1110.002",
+      "finding_ids": [
+        "ATK-06-weak-key"
+      ],
+      "ics": "T1694.001",
+      "result": "ATK-06-weak-key",
+      "step": "weak-key-keyset"
+    },
+    {
+      "attack": "keyset",
+      "enterprise": "T1040",
+      "finding_ids": [
+        "ATK-04-keyset"
+      ],
+      "ics": "T0842",
+      "result": "ATK-04-keyset",
+      "step": "weak-key-keyset"
+    },
+    {
+      "attack": "downgrade",
+      "enterprise": "T1689",
+      "finding_ids": [
+        "ATK-03-downgrade"
+      ],
+      "ics": "T0830",
+      "result": "ATK-03-downgrade",
+      "step": "downgrade"
+    },
+    {
+      "attack": "spoof",
+      "enterprise": "T1565.002",
+      "finding_ids": [
+        "ATK-08-spoof-unlock"
+      ],
+      "ics": "T1692.001",
+      "result": "ATK-08-spoof-unlock",
+      "step": "spoof"
+    },
+    {
+      "attack": "replay",
+      "enterprise": "T1557",
+      "finding_ids": [
+        "ATK-05a-replay-card-exchange"
+      ],
+      "ics": "T1692.002",
+      "result": "ATK-05a-replay-card-exchange",
+      "step": "replay"
+    },
+    {
+      "attack": "cve-2024-52288",
+      "enterprise": "T1557",
+      "finding_ids": [],
+      "ics": "T0830",
+      "result": "no finding",
+      "step": "cve-2024-52288-fixed"
+    }
+  ],
+  "findings": [
+    {
+      "attack_technique": "T1040",
+      "attack_technique_ics": "T0842",
+      "evidence": "PD address 101; codes seen: CMD_CAP, CMD_ID, CMD_POLL, REPLY_ACK, REPLY_PDCAP, REPLY_PDID, REPLY_RAW; Secure Channel posture: clear-text.",
+      "id": "ATK-01-sniff-pd-101",
+      "remediation": "Enable OSDP Secure Channel (SCBK) so bus traffic is authenticated and encrypted; do not operate readers in clear-text.",
+      "severity": "medium",
+      "title": "OSDP PD 101 observed on the bus"
+    },
+    {
+      "attack_technique": "T1018",
+      "attack_technique_ics": "T0888",
+      "evidence": "PD address 101; identity: vendor=0xbebafe model=1 version=1 serial=0xafbeadde firmware=173.222.173; advertised capabilities: OutputControl(compliance=1,count=1), LEDControl(compliance=2,count=1), AudibleControl(compliance=1,count=1), TextOutput(compliance=1,count=1), CheckCharacterSupport(compliance=1,count=0), CommunicationSecurity(compliance=1,count=0), ReceiveBufferSize(compliance=0,count=1).",
+      "id": "ATK-02-enumerate-pd-101",
+      "remediation": "Enable OSDP Secure Channel so identity (REPLY_PDID) and capability (REPLY_PDCAP) replies are authenticated and encrypted; unauthenticated clear-text enumeration lets any bus listener map readers before attacking.",
+      "severity": "low",
+      "title": "OSDP PD 101 enumerated"
+    },
+    {
+      "attack_technique": "T1110.002",
+      "attack_technique_ics": "T1694.001",
+      "evidence": "The captured CHLNG/CCRYPT handshake recomputes the PD cryptogram under SCBK-D (303132333435363738393a3b3c3d3e3f), so the Secure Channel Base Key in use is the public spec default. Confirmed by recomputing the PD cryptogram via AES-128-ECB (PyCA), not a heuristic.",
+      "id": "ATK-06-weak-key",
+      "remediation": "Replace the default Secure Channel Base Key (SCBK-D) with a unique per-site key; the spec default provides no confidentiality or authentication.",
+      "severity": "high",
+      "title": "OSDP Secure Channel uses the known weak key SCBK-D"
+    },
+    {
+      "attack_technique": "T1040",
+      "attack_technique_ics": "T0842",
+      "evidence": "The install-mode Secure Channel is protected by the known spec default SCBK-D (confirmed by recomputing the CHLNG/CCRYPT handshake via AES-128-ECB, not a heuristic), so the key enrolled over CMD_KEYSET (0x75) is readable by any bus observer: the recovered SCBK is the public OSDP spec default SCBK-D (303132333435363738393a3b3c3d3e3f). The payload was decrypted with the session key derived from SCBK-D and the R-MAC read from REPLY_RMAC_I.",
+      "id": "ATK-04-keyset",
+      "remediation": "Do not leave readers in install mode on the production bus; after enrolment, provision a unique per-site SCBK and disable install mode so the default SCBK-D no longer protects (and exposes) the key-set exchange.",
+      "severity": "high",
+      "title": "OSDP install-mode KEYSET enrolment exposes the Secure Channel Base Key"
+    },
+    {
+      "attack_technique": "T1689",
+      "attack_technique_ics": "T0830",
+      "evidence": "An in-path MITM stripped the CommunicationSecurity capability (function 0x09) from the PD's REPLY_PDCAP. Baseline session was Secure Channel (SCB seen=True, SCS codes=['0x11', '0x12', '0x13', '0x14', '0x15', '0x16', '0x18']); after the rewrite the CP never started the handshake and the attacked session is clear-text (no SCB, no SCS). The before/after pair proves the downgrade.",
+      "id": "ATK-03-downgrade",
+      "remediation": "Enable and ENFORCE OSDP Secure Channel on the CP (EnforceSecure): a CP that refuses a clear-text fallback cannot be downgraded by rewriting the PD's advertised capabilities. Do not rely on the PD advertising CommunicationSecurity.",
+      "severity": "high",
+      "title": "OSDP Secure Channel downgraded to clear-text by in-path capability rewrite"
+    },
+    {
+      "attack_technique": "T1565.002",
+      "attack_technique_ics": "T1692.001",
+      "evidence": "The PD's lock-state signal was LOCKED before the injection and flipped to UNLOCKED immediately after a forged CMD_OUT (output permanently ON) was injected cp->pd through the in-path MITM seam, carrying the live session's own sequence number so it was accepted as a legitimate command.",
+      "id": "ATK-08-spoof-unlock",
+      "remediation": "Enable OSDP Secure Channel with MAC+encryption (SCS_17/18) so an in-path attacker cannot forge or inject accepted commands; without channel integrity, any party on the bus can command the PD's outputs directly.",
+      "severity": "critical",
+      "title": "OSDP PD unlocked by a forged CMD_OUT injected onto the bus"
+    },
+    {
+      "attack_technique": "T1557",
+      "attack_technique_ics": "T1692.002",
+      "evidence": "1 clear-text REPLY_RAW card read(s) were captured live from the bus with no MAC and no freshness, so the exact bytes can be presented again. On the live bus the PD's lock-state signal went LOCKED -> UNLOCKED after the in-path relay's POLL-to-CMD_OUT rewrite (the ATK-08 mechanism). The byte-exact re-injection of the captured REPLY_RAW is proven by host unit tests in tests/osdp/test_attacks_replay.py, not on the live bus.",
+      "id": "ATK-05a-replay-card-exchange",
+      "remediation": "Enable OSDP Secure Channel with MAC+encryption (SCS_17/18) and reject replayed sequence numbers; a clear-text bus with no freshness guarantee lets any captured card-presentation exchange be reused verbatim.",
+      "severity": "high",
+      "title": "Clear-text card read is reusable and the bus accepts an in-path unlock (replay precondition met)"
+    }
+  ],
+  "generated_at": "2026-10-28T09:16:12+00:00",
+  "notice": "Authorized use only. interlock runs against its bundled, network-isolated lab by default. Use it on real equipment only with the owner's written authorization; physical mode is gated by --physical, a disclaimer and a typed scope confirmation. This tool ships no vendor default production keys; the only built-in key is the public OSDP specification default SCBK-D.",
+  "schema_version": 1,
+  "steps": [
+    {
+      "capped": [],
+      "detail": "12 cp->pd and 13 pd->cp frames decoded from 267 captured bytes",
+      "duration_s": 34.1,
+      "finding_ids": [
+        "ATK-01-sniff-pd-101",
+        "ATK-02-enumerate-pd-101"
+      ],
+      "key": "sniff-enumerate",
+      "method": "The read-only TCP tap in the attacker position records both directions of one cleartext CP-PD session; the captures are decoded with the interlock OSDP codec and folded into the PD topology (sniff) and the PD identity and capabilities (enumerate).",
+      "overrides": [
+        "docker-compose.tap.yml"
+      ],
+      "profile": "cleartext",
+      "status": "vulnerable",
+      "title": "Passive bus sniffing and device enumeration"
+    },
+    {
+      "capped": [],
+      "detail": "baseline poll answered; all nine corruptions handled; the PD answered every follow-up poll",
+      "duration_s": 36.0,
+      "finding_ids": [],
+      "key": "fuzz",
+      "method": "active: the nine deterministic corruptions sent from the idle attacker over one persistent connection to the PD (cp idle, docker-compose.fuzz.yml); liveness proven by a follow-up valid poll after each",
+      "overrides": [
+        "docker-compose.fuzz.yml"
+      ],
+      "profile": "cleartext",
+      "status": "not_vulnerable",
+      "title": "Command fuzzing of the PD parser"
+    },
+    {
+      "capped": [],
+      "detail": "15 cp->pd and 15 pd->cp frames decoded from 663 captured bytes",
+      "duration_s": 34.2,
+      "finding_ids": [
+        "ATK-06-weak-key",
+        "ATK-04-keyset"
+      ],
+      "key": "weak-key-keyset",
+      "method": "passive: read-only TCP tap on the install-mode Secure Channel bus; AES-verified SCBK-D check and KEYSET payload decryption on the host; each direction is decoded up to the 20000-frame ceiling and a clean result from a direction that reaches it is inconclusive",
+      "overrides": [
+        "docker-compose.tap.yml"
+      ],
+      "profile": "sc-scbkd",
+      "status": "vulnerable",
+      "title": "Weak Secure Channel key and KEYSET recovery"
+    },
+    {
+      "capped": [],
+      "detail": "the Secure Channel baseline was forced to clear-text by the in-path rewrite",
+      "duration_s": 68.3,
+      "finding_ids": [
+        "ATK-03-downgrade"
+      ],
+      "key": "downgrade",
+      "method": "before/after pair: untouched session via the tap, then the inline relay stripping CommunicationSecurity from REPLY_PDCAP; a CP that refuses the stripped PD (its own ENFORCE_SECURE line plus a relayed REPLY_PDCAP without CommunicationSecurity) is not_vulnerable",
+      "overrides": [
+        "docker-compose.tap.yml",
+        "docker-compose.downgrade.yml"
+      ],
+      "profile": "downgrade",
+      "status": "vulnerable",
+      "title": "Secure Channel downgrade to clear-text"
+    },
+    {
+      "capped": [],
+      "detail": "the PD was locked before arming and logged UNLOCKED after the forged CMD_OUT",
+      "duration_s": 34.3,
+      "finding_ids": [
+        "ATK-08-spoof-unlock"
+      ],
+      "key": "spoof",
+      "method": "active: inline rewrite relay turns an in-flight CMD_POLL into a forged CMD_OUT on a trigger file; oracle is the PD's own lock-state log line; a clean result needs the relay's own injection line in the attacker log",
+      "overrides": [
+        "docker-compose.spoof.yml"
+      ],
+      "profile": "cleartext",
+      "status": "vulnerable",
+      "title": "Unlock spoofing by command injection"
+    },
+    {
+      "capped": [],
+      "detail": "1 card read(s) captured live; the PD was locked before arming and logged UNLOCKED after",
+      "duration_s": 35.7,
+      "finding_ids": [
+        "ATK-05a-replay-card-exchange"
+      ],
+      "key": "replay",
+      "method": "active: the card read comes from the sniff-enumerate step's live capture; live proof via the in-path relay, which serves the same POLL-to-CMD_OUT rewrite as spoof on the replay trigger; the byte-exact re-injection of the captured REPLY_RAW is proven by host unit tests (tests/osdp/test_attacks_replay.py), not on the live bus; a clean result needs the relay's own injection line in the attacker log",
+      "overrides": [
+        "docker-compose.replay.yml"
+      ],
+      "profile": "cleartext",
+      "status": "vulnerable",
+      "title": "Clear-text card-read replay"
+    },
+    {
+      "capped": [],
+      "detail": "fixed LibOSDP 3.0.8 rejected the replayed REPLY_RMAC_I: \"cp-1  | OSDP: CP: PD-101: 2026-10-28T09:15:40Z   osdp_cp.c:658  [EMERG] Out of order REPLY_RMAC_I; has PD gone rogue?\"",
+      "duration_s": 36.7,
+      "finding_ids": [],
+      "key": "cve-2024-52288-fixed",
+      "method": "active: inline relay replays the live-captured REPLY_RMAC_I-first secure blob aligned to the CP's 2-bit sequence; oracle is the controller's re-authorisation count and its rejection line; the pinned-vulnerable core is not part of the default run (D-03)",
+      "overrides": [
+        "docker-compose.cve.yml"
+      ],
+      "profile": "sc-scbkd",
+      "status": "not_vulnerable",
+      "title": "CVE-2024-52288 REPLY_RMAC_I replay against the fixed LibOSDP core"
+    }
+  ],
+  "target": {
+    "kind": "lab",
+    "project": "interlock-assess"
+  },
+  "tool": {
+    "name": "interlock",
+    "version": "0.1.0"
+  }
+}
