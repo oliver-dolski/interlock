@@ -818,6 +818,55 @@ def test_network_that_is_not_a_plain_compose_bridge_is_a_containment_violation(
     _assert_one_naming(_checked(lab, config), "labnet", key)
 
 
+@pytest.mark.parametrize(
+    "name", ["bridge", "host", "interlock-lab_labnet", "interlock-assess_other", ""]
+)
+def test_network_named_onto_anything_but_its_compose_name_is_a_containment_violation(
+    tmp_path: Path, name: str
+) -> None:
+    # A name that is not {project}_{key} can join a network compose did not create.
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["networks"]["labnet"]["name"] = name
+    _assert_one_naming(_checked(lab, config), "labnet", "name")
+
+
+@pytest.mark.parametrize("name", ["operator-data", "interlock-assess_other", "captures"])
+def test_named_volume_named_onto_anything_but_its_compose_name_is_a_containment_violation(
+    tmp_path: Path, name: str
+) -> None:
+    # A volume created outside compose (say, a bind of / as a local volume) is mounted as is.
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["volumes"] = {"captures": {"name": name}}
+    config["services"]["attacker"]["volumes"].append(
+        {"type": "volume", "source": "captures", "target": "/app/capture"}
+    )
+    _assert_one_naming(_checked(lab, config), "captures", "name")
+
+
+def test_network_without_a_name_is_contained(tmp_path: Path) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    del config["networks"]["labnet"]["name"]
+    assert _checked(lab, config) == []
+
+
+@pytest.mark.parametrize("project", [None, "", 5, ["interlock-assess"]])
+def test_config_without_a_project_name_is_a_containment_violation(
+    tmp_path: Path, project: object
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    if project is None:
+        del config["name"]
+    else:
+        config["name"] = project
+    violations = _checked(lab, config)
+    assert len(violations) == 1, violations
+    assert violations[0].startswith("name:"), violations
+
+
 def test_explicit_bridge_driver_is_contained(tmp_path: Path) -> None:
     lab = _lab(tmp_path)
     config = _in_lab(lab)
