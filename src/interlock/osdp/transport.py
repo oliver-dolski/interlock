@@ -50,6 +50,11 @@ OnBytes = Callable[["Direction", bytes], None]
 # be a complete frame.
 Transform = Callable[["Direction", bytes], bytes]
 
+# Told after each forward of a rewritten chunk whether the destination took all of it (True)
+# or the write failed (False). A Transform that may only report what really went out (the
+# spoof relay's injection sentinel) listens here instead of trusting what it returned.
+OnForward = Callable[["Direction", bytes, bool], None]
+
 
 class Direction(str, Enum):
     """Which way a chunk of bytes was travelling on the cp<->pd path.
@@ -141,6 +146,7 @@ def _pump_socket_rewrite(
     dst: socket.socket,
     direction: Direction,
     transform: Transform,
+    on_forward: OnForward | None = None,
 ) -> None:
     """Relay bytes from ``src`` to ``dst``, rewriting each chunk through ``transform``.
 
@@ -149,7 +155,9 @@ def _pump_socket_rewrite(
     modified bytes rewrite the traffic, ``b""`` drops the chunk, and returning the
     original passes it through unchanged. Keeps the same OSError-break discipline and
     daemon-thread-per-direction shape as the read-only pump; the only change is the
-    emit+forward pair becoming transform+conditional-forward.
+    emit+forward pair becoming transform+conditional-forward. ``on_forward``, when given,
+    hears the outcome of every forward after the write, the failed one that ends the pump
+    included; a dropped chunk is never forwarded, so it is never reported.
     """
     while True:
         try:
@@ -163,7 +171,11 @@ def _pump_socket_rewrite(
             try:
                 dst.sendall(out)
             except OSError:
+                if on_forward is not None:
+                    on_forward(direction, out, False)
                 break
+            if on_forward is not None:
+                on_forward(direction, out, True)
 
 
 def _pump_fd_rewrite(
@@ -270,7 +282,12 @@ class TCPTap:
             cp_sock, _addr = listener.accept()
             self._bridge(cp_sock, self._on_bytes)
 
-    def _bridge_rewrite(self, cp_sock: socket.socket, transform: Transform) -> None:
+    def _bridge_rewrite(
+        self,
+        cp_sock: socket.socket,
+        transform: Transform,
+        on_forward: OnForward | None = None,
+    ) -> None:
         """Connect upstream and pump both directions through ``transform`` until closed.
 
         The write-capable twin of ``_bridge``: reuses ``_connect_upstream`` unchanged and
@@ -280,27 +297,28 @@ class TCPTap:
         pd_sock = self._connect_upstream()
         upstream_thread = threading.Thread(
             target=_pump_socket_rewrite,
-            args=(cp_sock, pd_sock, Direction.cp_to_pd, transform),
+            args=(cp_sock, pd_sock, Direction.cp_to_pd, transform, on_forward),
             daemon=True,
         )
         upstream_thread.start()
-        _pump_socket_rewrite(pd_sock, cp_sock, Direction.pd_to_cp, transform)
+        _pump_socket_rewrite(pd_sock, cp_sock, Direction.pd_to_cp, transform, on_forward)
         upstream_thread.join()
         cp_sock.close()
         pd_sock.close()
 
-    def serve_rewrite(self, transform: Transform) -> None:
+    def serve_rewrite(self, transform: Transform, on_forward: OnForward | None = None) -> None:
         """Accept CP connections and bridge each to the PD through ``transform``, forever.
 
         The active-MITM entrypoint: identical listen/connect plumbing to
         ``serve_forever``, but every chunk flows through ``transform`` (rewrite / drop /
         pass-through) instead of the read-only ``on_bytes`` observation. This is how
-        downgrade / spoof / fuzz drive the live lab bus.
+        downgrade / spoof / fuzz drive the live lab bus. ``on_forward`` hears the outcome of
+        every forward in both directions (see ``_pump_socket_rewrite``).
         """
         listener = self._listen()
         while True:
             cp_sock, _addr = listener.accept()
-            self._bridge_rewrite(cp_sock, transform)
+            self._bridge_rewrite(cp_sock, transform, on_forward)
 
     def observe(self) -> Iterator[tuple[Direction, bytes]]:
         """Yield observed (direction, bytes) for one bridged CP<->PD session.

