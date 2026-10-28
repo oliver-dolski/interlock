@@ -19,7 +19,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 from typer.testing import CliRunner
@@ -48,7 +48,7 @@ from interlock.osdp.assessment import (
     run_assessment,
     write_reports,
 )
-from interlock.osdp.attacks import downgrade
+from interlock.osdp.attacks import downgrade, replay
 from interlock.osdp.lab_session import LabSession
 from interlock.osdp.transport import Direction
 from interlock.plugin import Finding, Severity, finding_to_dict
@@ -1405,13 +1405,71 @@ def test_replay_of_the_live_card_read_is_vulnerable(lab_dir: Path) -> None:
     result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
     assert result.status is Status.VULNERABLE
     assert _finding_ids(result) == {"ATK-05a-replay-card-exchange"}
-    # The finding never claims a live byte-exact re-injection without the method beside it.
+    # The finding claims only what ran live: a met replay precondition, HIGH, not CRITICAL.
     [finding] = result.findings
-    assert finding.evidence.endswith(assessment.REPLAY_LIVE_NOTE)
-    assert "shared POLL-to-CMD_OUT rewrite" in finding.evidence
+    card_reads = len(replay.capture_card_exchange(_cleartext_frames()))
+    assert finding == replay.inferred_replay_finding(card_reads)
+    assert finding.severity is Severity.HIGH
+    assert "replay precondition met" in finding.title
+    assert f"{card_reads} clear-text REPLY_RAW" in finding.evidence
+    assert "host unit tests" in finding.evidence
+    assert not hasattr(assessment, "REPLAY_LIVE_NOTE")
     assert _bring_ups(fake) == [("cleartext", ("docker-compose.replay.yml",))]
     assert _touch_argv(lab_dir, "docker-compose.replay.yml", _REPLAY_TRIGGER) in fake.argvs
     assert fake.touches == [_REPLAY_TRIGGER]
+
+
+def test_replay_without_a_lock_transition_is_not_vulnerable(lab_dir: Path) -> None:
+    fake = FakeCompose(touch_logs={_REPLAY_TRIGGER: {"attacker": _INJECTED}})
+    result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
+    assert result.status is Status.NOT_VULNERABLE
+    assert result.detail.startswith("armed; the relay injected a forged CMD_OUT")
+    assert "interlock: injected CMD_OUT seq=1" in result.detail
+    assert fake.touches == [_REPLAY_TRIGGER]
+
+
+def test_replay_without_the_injection_line_is_inconclusive(lab_dir: Path) -> None:
+    fake = FakeCompose(touch_logs={_REPLAY_TRIGGER: {}})
+    result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
+    assert result.status is Status.INCONCLUSIVE
+    assert "never injected" in result.detail
+    assert fake.touches == [_REPLAY_TRIGGER]
+
+
+def test_replay_unlocked_without_a_finding_is_inconclusive(
+    lab_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_finding(
+        captured: Sequence[bytes],
+        inject: Callable[[bytes], None],
+        probe: Callable[[], bool],
+    ) -> list[Finding]:
+        for frame in captured:
+            inject(frame)
+        return []
+
+    monkeypatch.setattr(assessment.replay, "run_replay", no_finding)
+    fake = FakeCompose()
+    result = _run_after_seed(lab_dir, fake, _cleartext_frames(), "replay")
+    assert result.status is Status.INCONCLUSIVE
+    assert "cannot be attributed" in result.detail
+    assert fake.touches == [_REPLAY_TRIGGER]
+
+
+def test_arm_turns_a_windows_path_into_a_posix_trigger() -> None:
+    # On Windows the trigger constants are Windows paths; the attacker is Linux.
+    fake = FakeCompose()
+    handle = lab_session.LabHandle(
+        base_cmd=("docker", "compose"),
+        env={},
+        runner=fake,
+        sleep=lambda _seconds: None,
+        clock=lambda: 0.0,
+    )
+    assessment._arm(handle, PureWindowsPath("/tmp/interlock-spoof-fire"))
+    [argv] = fake.argvs
+    assert argv[-1] == "/tmp/interlock-spoof-fire"
+    assert argv[-2:] == ["touch", "/tmp/interlock-spoof-fire"]
 
 
 def test_replay_without_the_sniff_capture_is_inconclusive(lab_dir: Path) -> None:
@@ -1735,7 +1793,21 @@ def test_full_report_reads_as_an_attack_mapped_assessment(tmp_path: Path, lab_di
         assert f"- {step.key}: {step.method}" in notes
     assert "live proof via the in-path relay" in notes
     replay_section = markdown.split("## ATK-05a-replay-card-exchange:")[1].split("\n## ")[0]
-    assert assessment.REPLAY_LIVE_NOTE in replay_section
+    assert "- **Severity:** high" in replay_section
+    assert "proven by host unit tests" in replay_section
+    # Of the active steps, only spoof's live-proven unlock is critical.
+    active = {"spoof", "replay", "cve-2024-52288-fixed"}
+    all_steps = document["steps"]
+    assert isinstance(all_steps, list)
+    active_ids = {
+        fid for step in all_steps if step["key"] in active for fid in step["finding_ids"]
+    }
+    findings = document["findings"]
+    assert isinstance(findings, list)
+    critical = sorted(
+        f["id"] for f in findings if f["id"] in active_ids and f["severity"] == "critical"
+    )
+    assert critical == ["ATK-08-spoof-unlock"]
     assert "byte-exact" in notes
 
     assert document["attack_version"] == "20.0"

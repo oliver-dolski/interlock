@@ -9,14 +9,19 @@ Covers both halves:
   on an observed locked->unlocked transition; an empty capture performs no injection and
   returns ``[]`` immediately (the flagged-assumption true negative), and an already-unlocked
   baseline is never claimed as a replay success.
+- ``inferred_replay_finding`` is the assessment's honest replay finding: the same id and
+  technique, HIGH, stating what ran live and that the byte-exact re-injection is host-proven.
 """
 
 from __future__ import annotations
 
 from interlock.osdp import codec, constants
+from interlock.osdp.attack_map import MAPPINGS
+from interlock.osdp.attacks import replay
 from interlock.osdp.attacks.replay import capture_card_exchange, run_replay
 from interlock.osdp.codec import OsdpFrame
 from interlock.osdp.transport import Direction
+from interlock.plugin import Severity
 
 _PD_ADDRESS = 101
 
@@ -149,3 +154,21 @@ def test_run_replay_is_inconclusive_when_baseline_already_unlocked() -> None:
 def test_run_replay_returns_empty_when_injection_has_no_effect() -> None:
     findings = run_replay([b"frame"], lambda frame: None, lambda: False)
     assert findings == []
+
+
+# --------------------------------------------------------------------------------------
+# The assessment's finding: what the live run showed, nothing more.
+# --------------------------------------------------------------------------------------
+
+
+def test_inferred_replay_finding_states_what_ran() -> None:
+    finding = replay.inferred_replay_finding(3)
+    assert finding.id == "ATK-05a-replay-card-exchange"
+    assert finding.severity is Severity.HIGH
+    assert finding.attack_technique == MAPPINGS["replay"].enterprise
+    assert finding.attack_technique_ics == MAPPINGS["replay"].ics
+    assert "replay precondition met" in finding.title
+    assert "replaying" not in finding.title
+    for phrase in ("3 clear-text REPLY_RAW", "POLL-to-CMD_OUT", "ATK-08", "host unit tests"):
+        assert phrase in finding.evidence, phrase
+    assert finding.remediation
