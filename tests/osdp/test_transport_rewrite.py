@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -96,6 +97,56 @@ def test_socket_rewrite_tags_direction() -> None:
     forwarded = _run_socket_pump(transform, SENT)
     assert forwarded == SENT
     assert seen and all(direction is Direction.cp_to_pd for direction in seen)
+
+
+class _BrokenDestination:
+    """A destination whose every write fails, like a peer that has gone away."""
+
+    def sendall(self, data: bytes) -> None:
+        raise BrokenPipeError("peer gone")
+
+
+def _forwards(dst: object, transform: Callable[[Direction, bytes], bytes]) -> list[tuple[Any, ...]]:
+    """Run ``_pump_socket_rewrite`` into ``dst`` and return every ``on_forward`` report."""
+    reports: list[tuple[Any, ...]] = []
+    src_feed, src = socket.socketpair()
+    thread = threading.Thread(
+        target=_pump_socket_rewrite,
+        args=(src, dst, Direction.cp_to_pd, transform),
+        kwargs={"on_forward": lambda *report: reports.append(report)},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        src_feed.sendall(SENT)
+        src_feed.close()
+        thread.join(timeout=3.0)
+    finally:
+        src.close()
+    assert not thread.is_alive()
+    return reports
+
+
+def test_socket_rewrite_reports_a_forward_after_it_is_written() -> None:
+    dst, dst_recv = socket.socketpair()
+    try:
+        reports = _forwards(dst, lambda direction, data: data)
+    finally:
+        dst.close()
+        dst_recv.close()
+    assert reports
+    assert all(report[0] is Direction.cp_to_pd and report[2] is True for report in reports)
+    assert b"".join(report[1] for report in reports) == SENT
+
+
+def test_socket_rewrite_reports_a_failed_forward_and_stops() -> None:
+    # A rewritten chunk that never reached the far side must say so (WR-04).
+    reports = _forwards(_BrokenDestination(), lambda direction, data: data)
+    assert reports == [(Direction.cp_to_pd, SENT, False)]
+
+
+def test_socket_rewrite_reports_nothing_for_a_dropped_chunk() -> None:
+    assert _forwards(_BrokenDestination(), lambda direction, data: b"") == []
 
 
 def _readable(fd: int, timeout: float) -> bool:

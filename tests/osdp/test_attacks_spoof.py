@@ -7,12 +7,16 @@ Covers both crafted frames and the before/after verdict:
 - ``unlock_transform`` rewrites the first cp->pd ``CMD_POLL`` into the unlock, preserving the
   intercepted frame's own sequence number, and passes every other frame through unchanged
   (one-shot: later POLLs are untouched). It reports the injection once, through ``on_inject``,
-  and ``announce_inject`` prints the line the assessment reads as proof of injection.
+  only after the relay says the forged frame was written; a failed write is never announced
+  and re-arms the injection. ``announce_inject`` prints the line the assessment reads as proof
+  of injection, and the announcing lab relays wire every forward back to the transform.
 - ``run_spoof`` emits a CRITICAL Finding only on an observed locked->unlocked transition, and
   ``[]`` when the baseline was already unlocked (flagged-assumption guard).
 """
 
 from __future__ import annotations
+
+from typing import Any, ClassVar
 
 import pytest
 
@@ -136,9 +140,71 @@ def test_unlock_transform_buffers_a_poll_split_across_two_chunks() -> None:
 def test_unlock_transform_reports_the_injected_sequence_once() -> None:
     calls: list[int] = []
     transform = unlock_transform(on_inject=calls.append)
-    transform(Direction.cp_to_pd, _poll(sequence=2))
-    transform(Direction.cp_to_pd, _poll(sequence=3))
+    for sequence in (2, 3):
+        out = transform(Direction.cp_to_pd, _poll(sequence=sequence))
+        transform.forwarded(Direction.cp_to_pd, out, True)
     assert calls == [2], "on_inject must fire once, with the rewritten POLL's sequence"
+
+
+def test_unlock_transform_announces_only_after_the_forged_frame_is_sent() -> None:
+    # The sentinel is the assessment's proof that the forged frame reached the bus (WR-04).
+    calls: list[int] = []
+    transform = unlock_transform(on_inject=calls.append)
+    out = transform(Direction.cp_to_pd, _poll(sequence=2))
+    assert calls == [], "building the forged frame is not sending it"
+    transform.forwarded(Direction.cp_to_pd, out, True)
+    assert calls == [2]
+
+
+def test_a_failed_send_is_not_announced_and_rearms_the_injection() -> None:
+    calls: list[int] = []
+    transform = unlock_transform(on_inject=calls.append)
+    lost = transform(Direction.cp_to_pd, _poll(sequence=2))
+    transform.forwarded(Direction.cp_to_pd, lost, False)
+    assert calls == [], "a forged frame that never left must not read as injected"
+    retry = transform(Direction.cp_to_pd, _poll(sequence=3))
+    frame = codec.decode(retry)
+    assert frame.code == constants.CMD_OUT
+    assert frame.control & constants.PKT_CONTROL_SQN == 3
+    transform.forwarded(Direction.cp_to_pd, retry, True)
+    assert calls == [3]
+
+
+def test_a_forward_in_the_other_direction_does_not_announce() -> None:
+    calls: list[int] = []
+    transform = unlock_transform(on_inject=calls.append)
+    out = transform(Direction.cp_to_pd, _poll(sequence=2))
+    transform.forwarded(Direction.pd_to_cp, b"\xff", True)
+    assert calls == []
+    transform.forwarded(Direction.cp_to_pd, out, True)
+    assert calls == [2]
+
+
+class _RecordingTap:
+    """Stands in for ``TCPTap``: records what a lab relay serves instead of listening."""
+
+    served: ClassVar[list[tuple[Any, Any]]] = []
+
+    def __init__(self, port: int, upstream: tuple[str, int]) -> None:
+        pass
+
+    def serve_rewrite(self, transform: Any, on_forward: Any = None) -> None:
+        self.served.append((transform, on_forward))
+
+
+@pytest.mark.parametrize("module", ["spoof", "replay"])
+def test_the_announcing_lab_relays_report_every_forward_to_the_transform(
+    monkeypatch: pytest.MonkeyPatch, module: str
+) -> None:
+    from interlock.osdp.attacks import replay
+
+    relay = {"spoof": spoof, "replay": replay}[module]
+    monkeypatch.delenv("ATTACK_MODE", raising=False)
+    monkeypatch.setattr(_RecordingTap, "served", [])
+    monkeypatch.setattr(relay, "TCPTap", _RecordingTap)
+    relay.main()
+    [(transform, on_forward)] = _RecordingTap.served
+    assert on_forward == transform.forwarded
 
 
 def test_unlock_transform_reports_nothing_while_disarmed() -> None:
