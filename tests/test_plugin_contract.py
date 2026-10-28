@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.metadata import entry_points
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -216,10 +217,14 @@ def test_import_scan_passes_a_clean_core_module() -> None:
 
 @dataclass(frozen=True)
 class _FakeEntryPoint:
-    """An ``interlock.commands`` entry point whose ``load()`` returns or raises ``target``."""
+    """An ``interlock.commands`` entry point whose ``load()`` returns or raises ``target``.
+
+    ``dist`` stands in for the distribution that registered it (anything with a ``name``).
+    """
 
     name: str
     target: object
+    dist: object = None
 
     def load(self) -> object:
         if isinstance(self.target, BaseException):
@@ -338,6 +343,80 @@ def test_a_valid_factory_is_attached(monkeypatch: pytest.MonkeyPatch) -> None:
     result = CliRunner().invoke(built, ["proto", "ping"])
     assert result.exit_code == 0, result.output
     assert result.output == "pong\n"
+
+
+# A name two distributions both register is never resolved by install order (WR-06). ---------
+
+
+def _from(distribution: str) -> SimpleNamespace:
+    return SimpleNamespace(name=distribution)
+
+
+def _hostile_group() -> typer.Typer:
+    group = typer.Typer(help="Another package's group under a taken name.")
+
+    @group.command()
+    def ping() -> None:
+        """Answer as someone else."""
+        typer.echo("hijacked")
+
+    return group
+
+
+def _loaded_by(record: list[str], name: str, target: object) -> object:
+    """Return a factory that records ``name`` when the core runs it."""
+
+    def factory() -> object:
+        record.append(name)
+        return target() if callable(target) else target
+
+    return factory
+
+
+def test_a_name_two_third_party_distributions_register_is_refused_for_both(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    build = _install_command_groups(
+        monkeypatch,
+        _FakeEntryPoint("proto", _group, _from("acme-osdp")),
+        _FakeEntryPoint("proto", _hostile_group, _from("Other_Osdp")),
+    )
+    assert _commands(build()) == ["plugins", "run"]
+    err = capsys.readouterr().err
+    assert "interlock: skipping command group 'proto':" in err
+    assert "acme-osdp" in err and "other-osdp" in err
+
+
+@pytest.mark.parametrize("core_first", [True, False])
+def test_a_third_party_package_never_replaces_the_core_osdp_group(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], core_first: bool
+) -> None:
+    core = _FakeEntryPoint("osdp", _group, _from("interlock"))
+    hostile = _FakeEntryPoint("osdp", _hostile_group, _from("evil-osdp"))
+    order = (core, hostile) if core_first else (hostile, core)
+    build = _install_command_groups(monkeypatch, *order)
+    built = build()
+    err = capsys.readouterr().err
+    assert "interlock: skipping command group 'osdp' from evil-osdp:" in err
+    assert "interlock" in err.split("evil-osdp:", 1)[1]
+    result = CliRunner().invoke(built, ["osdp", "ping"])
+    assert result.exit_code == 0, result.output
+    assert result.output == "pong\n"
+
+
+def test_a_refused_duplicate_is_never_loaded(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loaded: list[str] = []
+    build = _install_command_groups(
+        monkeypatch,
+        _FakeEntryPoint("proto", _loaded_by(loaded, "acme", _group), _from("acme-osdp")),
+        _FakeEntryPoint("proto", _loaded_by(loaded, "other", _group), _from("other-osdp")),
+        _FakeEntryPoint("osdp", _loaded_by(loaded, "core", _group), _from("interlock")),
+        _FakeEntryPoint("osdp", _loaded_by(loaded, "evil", _group), _from("evil-osdp")),
+    )
+    assert _commands(build()) == ["osdp", "plugins", "run"]
+    assert loaded == ["core"]
 
 
 def test_the_real_cli_and_its_osdp_group_answer_help() -> None:
