@@ -261,8 +261,13 @@ def _base(lab: Path, *overrides: str) -> list[str]:
 
 
 def _overrides(argv: Sequence[str]) -> tuple[str, ...]:
-    """Return the override file names of a compose argv (every -f after the base file)."""
-    files = [PurePosixPath(argv[i + 1]).name for i, token in enumerate(argv) if token == "-f"]
+    """Return the override file names of a compose argv (every -f after the base file).
+
+    Windows path rules split on both '/' and the backslash, so the native argv of either host
+    reads the same; on Windows this is the host flavour. PosixPath never splits on a backslash,
+    which is why the host-flavour Path would keep the Windows-form run off a POSIX host.
+    """
+    files = [PureWindowsPath(argv[i + 1]).name for i, token in enumerate(argv) if token == "-f"]
     return tuple(files[1:])
 
 
