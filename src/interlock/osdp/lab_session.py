@@ -13,7 +13,10 @@ from the allow-list (D-03). Every command is a list argv handed to ``subprocess.
 shell. It adds no published port and changes no compose file, so SAFE-01 containment is
 unchanged: captures leave the attacker container only as base64 over ``docker compose exec``.
 ``check_containment`` proves that per file set before anything runs: it resolves the files with
-``docker compose config`` and reports every ``CONTAINMENT_RULES`` violation (WR-07). Every
+``docker compose config`` and reports every ``CONTAINMENT_RULES`` violation (WR-07). The check
+denies by default: top-level sections, service keys, network and volume keys outside their
+allow-lists are violations, and bind sources and build contexts must resolve inside the lab dir.
+Every
 compose call runs with the bus topology pinned (``_PINNED_TOPOLOGY``), so a CP_UPSTREAM or
 ATTACKER_UPSTREAM left in the operator's shell cannot reroute the lab (WR-03).
 
@@ -77,10 +80,36 @@ CONTAINMENT_RULES: tuple[str, ...] = (
     "every service on labnet only",
     "every bind mount read-only",
     "cp upstream pinned to the attacker",
+    "only allow-listed top-level sections and service keys",
+    "every network a plain compose-created bridge",
+    "every bind mount from inside the lab dir",
+    "every mount a bind or plain named volume or tmpfs",
+    "every build a plain build from the lab dir",
 )
 
 # The one network every service may join (docker-compose.yml).
 _LAB_NETWORK = "labnet"
+
+# Deny by default: anything a resolved config carries outside these sets is a violation, so a
+# key no rule names (security_opt, userns_mode, volumes_from, use_api_socket, ...) cannot pass.
+_TOP_LEVEL_KEYS = frozenset({"name", "networks", "services", "volumes"})
+# The keys the bundled files resolve to, plus keys that only shape the container itself.
+# logging is absent: a log driver (syslog, gelf, fluentd) ships output to a network address.
+_SERVICE_KEYS = frozenset(
+    {
+        "build", "command", "depends_on", "entrypoint", "environment", "networks", "volumes",
+        "working_dir", "image", "container_name", "hostname", "labels", "restart",
+        "healthcheck", "tty", "stdin_open", "pull_policy", "init", "stop_signal",
+        "stop_grace_period", "user", "platform",
+    }
+)
+# external would join a network compose did not create, so its internal flag is never applied.
+_NETWORK_KEYS = frozenset({"name", "internal", "ipam", "labels", "driver"})
+# driver, driver_opts or external can back a named volume with a host path or a remote share.
+_VOLUME_KEYS = frozenset({"name", "labels"})
+_MOUNT_TYPES = frozenset({"bind", "volume", "tmpfs"})
+# Any other build option reaches past the lab dir: network, ssh, secrets, additional_contexts.
+_BUILD_KEYS = frozenset({"context", "dockerfile"})
 
 # Service keys that reach past the lab when set to any truthy value, with the reason a
 # violation gives. ``ports`` publishes to the host; the others hand a container host devices,
@@ -96,6 +125,7 @@ _ESCAPE_KEYS: tuple[tuple[str, str], ...] = (
     ("pid", "joins a foreign pid namespace"),
     ("ipc", "joins a foreign ipc namespace"),
 )
+_ESCAPE_KEY_NAMES = frozenset(key for key, _ in _ESCAPE_KEYS)
 
 # Upper bound on the stderr carried into a LabError, so a noisy build cannot flood a report.
 _STDERR_TAIL = 2000
@@ -157,22 +187,71 @@ def _as_mapping(section: object) -> Mapping[object, object] | None:
     return {key: value if sep else None for key, sep, value in pairs}
 
 
-def _service_violations(name: object, service: Mapping[object, object]) -> list[str]:
+def _inside(lab_dir: Path, *parts: object) -> bool:
+    """Return True when ``parts`` joined onto ``lab_dir`` resolve to a path inside it.
+
+    Compose prints absolute sources, which the join keeps as they are; resolving follows
+    symlinks and ``..``, so neither can lead out of the lab dir. Anything else fails closed.
+    """
+    if not parts or not all(isinstance(part, str) and part for part in parts):
+        return False
+    try:
+        resolved = lab_dir.joinpath(*(str(part) for part in parts)).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return resolved.is_relative_to(lab_dir)
+
+
+def _volumes_reason(volumes: object, lab_dir: Path) -> str | None:
+    """Return why a service's ``volumes`` breaks containment (None when it does not)."""
+    if not isinstance(volumes, list):
+        return "is not a list of mounts"
+    for volume in volumes:
+        if not isinstance(volume, Mapping):
+            return "is not a list of mounts"
+        kind = volume.get("type")
+        if kind not in _MOUNT_TYPES:
+            return "holds a mount that is not bind, volume or tmpfs"
+        if kind != "bind":
+            continue
+        if volume.get("read_only") is not True:
+            return "holds a bind mount that is not read-only"
+        if not _inside(lab_dir, volume.get("source")):
+            return "holds a bind mount from outside the lab dir"
+    return None
+
+
+def _plain_build(build: object, lab_dir: Path) -> bool:
+    """Return True for a build of only a context and Dockerfile, both inside the lab dir."""
+    if not isinstance(build, Mapping) or set(build) - _BUILD_KEYS:
+        return False
+    context = build.get("context")
+    return _inside(lab_dir, context) and _inside(
+        lab_dir, context, build.get("dockerfile", "Dockerfile")
+    )
+
+
+def _service_violations(
+    name: object, service: Mapping[object, object], lab_dir: Path
+) -> list[str]:
     """Return the containment violations of one resolved service, naming only keys."""
     violations: list[str] = []
     for key, reason in _ESCAPE_KEYS:
         if service.get(key):
             violations.append(f"service {name}: {key} {reason}")
+    violations += [
+        f"service {name}: {extra} is not an allow-listed service key"
+        for extra in service
+        if extra not in _SERVICE_KEYS and extra not in _ESCAPE_KEY_NAMES
+    ]
     networks = _as_mapping(service.get("networks"))
     if networks is None or set(networks) - {_LAB_NETWORK}:
         violations.append(f"service {name}: networks is not {_LAB_NETWORK} only")
-    volumes = service.get("volumes", [])
-    if not isinstance(volumes, list) or not all(
-        isinstance(volume, Mapping)
-        and (volume.get("type") != "bind" or volume.get("read_only") is True)
-        for volume in volumes
-    ):
-        violations.append(f"service {name}: volumes holds a bind mount that is not read-only")
+    mounts = _volumes_reason(service.get("volumes", []), lab_dir)
+    if mounts is not None:
+        violations.append(f"service {name}: volumes {mounts}")
+    if "build" in service and not _plain_build(service["build"], lab_dir):
+        violations.append(f"service {name}: build is not a plain build from the lab dir")
     if name == "cp":
         environment = _as_mapping(service.get("environment"))
         pinned = _PINNED_TOPOLOGY["CP_UPSTREAM"]
@@ -181,28 +260,70 @@ def _service_violations(name: object, service: Mapping[object, object]) -> list[
     return violations
 
 
-def containment_violations(config: Mapping[str, object]) -> list[str]:
+def _network_violations(name: object, network: object) -> list[str]:
+    """Return the violations of one top-level network: internal, a plain bridge, nothing else."""
+    if not isinstance(network, Mapping) or network.get("internal") is not True:
+        return [f"network {name}: internal is not true"]
+    violations = [
+        f"network {name}: {key} is not an allow-listed network key"
+        for key in network
+        if key not in _NETWORK_KEYS
+    ]
+    if network.get("driver", "bridge") != "bridge":
+        violations.append(f"network {name}: driver is not bridge")
+    return violations
+
+
+def _named_volume_violations(volumes: object) -> list[str]:
+    """Return the violations of the top-level named volumes: plain local volumes only."""
+    if not isinstance(volumes, Mapping):
+        return ["volumes: not a mapping"]
+    violations: list[str] = []
+    for name, volume in volumes.items():
+        if volume is None:
+            continue
+        if not isinstance(volume, Mapping):
+            violations.append(f"volume {name}: not a mapping")
+            continue
+        violations += [
+            f"volume {name}: {key} is not an allow-listed volume key"
+            for key in volume
+            if key not in _VOLUME_KEYS
+        ]
+    return violations
+
+
+def containment_violations(config: Mapping[str, object], lab_dir: Path) -> list[str]:
     """Return every containment rule a resolved ``docker compose config`` document breaks.
 
-    Pure and total: a missing or malformed section is itself a violation, never an exception.
-    Each text names the network or service and the key, never a value, so no host path from
-    the resolved config (a bind source) can reach a message or a report.
+    ``lab_dir`` is the directory of the base compose file: bind sources and build contexts
+    must resolve inside it. Deny by default: a top-level section, service, network or volume
+    key outside its allow-list is a violation. Pure and total: a missing or malformed section
+    is itself a violation, never an exception. Each text names the section, network, volume
+    or service and the key, never a value, so no host path from the resolved config (a bind
+    source, a build context) can reach a message or a report.
     """
-    violations: list[str] = []
+    lab = Path(lab_dir).resolve()
+    violations = [
+        f"{key}: not an allow-listed top-level section"
+        for key in config
+        if key not in _TOP_LEVEL_KEYS
+    ]
     networks = config.get("networks")
     if not isinstance(networks, Mapping):
         violations.append("networks: missing or not a mapping")
     else:
         for name, network in networks.items():
-            if not isinstance(network, Mapping) or network.get("internal") is not True:
-                violations.append(f"network {name}: internal is not true")
+            violations += _network_violations(name, network)
+    if "volumes" in config:
+        violations += _named_volume_violations(config["volumes"])
     services = config.get("services")
     if not isinstance(services, Mapping):
         violations.append("services: missing or not a mapping")
     else:
         for name, service in services.items():
             if isinstance(service, Mapping):
-                violations += _service_violations(name, service)
+                violations += _service_violations(name, service, lab)
             else:
                 violations.append(f"service {name}: not a mapping")
         if "cp" not in services:
@@ -211,12 +332,18 @@ def containment_violations(config: Mapping[str, object]) -> list[str]:
 
 
 def containment_sentence(files: Sequence[str]) -> str:
-    """Describe the containment check the preflight ran over ``files`` (base file first)."""
+    """Describe the containment check the preflight ran over ``files`` (base file first).
+
+    The closing clause says what the rules add up to and what they do not cover, so the
+    report never claims more than the check proves.
+    """
     base, *overrides = files
     return (
         f"checked before the run with docker compose config over {base} plus each of "
-        f"{len(overrides)} overrides: {', '.join(CONTAINMENT_RULES)}; no real hardware is "
-        "reachable from the assessment"
+        f"{len(overrides)} overrides: {', '.join(CONTAINMENT_RULES)}; so no lab container "
+        "gets a host device, host privileges or namespaces, a host path outside the lab dir "
+        "or any network but the internal labnet (not covered: the image build steps and "
+        "the Docker daemon's own configuration)"
     )
 
 
@@ -345,7 +472,7 @@ class LabSession:
             parsed = None
         if not isinstance(parsed, dict):
             return ["docker compose config did not print a JSON object"]
-        return containment_violations(parsed)
+        return containment_violations(parsed, self.lab_dir)
 
     def reset(self) -> None:
         """Run ``down -v`` once for the project to clear leftovers of an interrupted run."""

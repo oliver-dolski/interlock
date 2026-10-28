@@ -427,6 +427,10 @@ _CLEAN_CONFIG: dict[str, Any] = {
 }
 
 
+# The lab dir the placeholder bind source of _CLEAN_CONFIG sits in.
+_LAB_DIR = Path("/lab")
+
+
 def _planted(service: str, key: str, value: object) -> dict[str, Any]:
     """Return a deep copy of ``_CLEAN_CONFIG`` with ``key: value`` set on one service."""
     config = copy.deepcopy(_CLEAN_CONFIG)
@@ -435,7 +439,7 @@ def _planted(service: str, key: str, value: object) -> dict[str, Any]:
 
 
 def test_clean_config_has_no_containment_violation() -> None:
-    assert containment_violations(_CLEAN_CONFIG) == []
+    assert containment_violations(_CLEAN_CONFIG, _LAB_DIR) == []
 
 
 @pytest.mark.parametrize(
@@ -452,7 +456,7 @@ def test_clean_config_has_no_containment_violation() -> None:
     ],
 )
 def test_containment_violation_per_service_key(service: str, key: str, value: object) -> None:
-    violations = containment_violations(_planted(service, key, value))
+    violations = containment_violations(_planted(service, key, value), _LAB_DIR)
     assert len(violations) == 1, violations
     assert service in violations[0]
     assert key in violations[0]
@@ -460,11 +464,12 @@ def test_containment_violation_per_service_key(service: str, key: str, value: ob
 
 @pytest.mark.parametrize(("key", "value"), [("privileged", False), ("cap_add", [])])
 def test_falsy_service_keys_are_not_containment_violations(key: str, value: object) -> None:
-    assert containment_violations(_planted("attacker", key, value)) == []
+    assert containment_violations(_planted("attacker", key, value), _LAB_DIR) == []
 
 
 def test_check_containment_reports_a_planted_device_end_to_end(tmp_path: Path) -> None:
-    planted = _planted("pd", "devices", ["/dev/ttyUSB0:/dev/ttyUSB0"])
+    planted = _in_lab(tmp_path)
+    planted["services"]["pd"]["devices"] = ["/dev/ttyUSB0:/dev/ttyUSB0"]
     runner = _Runner(stdout={"config": json.dumps(planted)})
 
     violations = _session(tmp_path, runner).check_containment(("docker-compose.spoof.yml",))
@@ -512,7 +517,7 @@ def test_containment_violation_per_topology_breach(
 ) -> None:
     config = copy.deepcopy(_CLEAN_CONFIG)
     breach(config)
-    violations = containment_violations(config)
+    violations = containment_violations(config, _LAB_DIR)
     assert len(violations) == 1, violations
     assert where in violations[0]
     assert key in violations[0]
@@ -521,7 +526,7 @@ def test_containment_violation_per_topology_breach(
 def test_containment_violation_never_names_a_host_path() -> None:
     source = "/home/operator/interlock/src"
     volumes = [{"type": "bind", "source": source, "target": "/app/src"}]
-    violations = containment_violations(_planted("attacker", "volumes", volumes))
+    violations = containment_violations(_planted("attacker", "volumes", volumes), _LAB_DIR)
     assert len(violations) == 1, violations
     assert "attacker" in violations[0] and "volumes" in violations[0]
     assert not any(source in text or "/home/operator" in text for text in violations)
@@ -551,7 +556,7 @@ def test_malformed_config_is_a_containment_violation_not_an_exception(
 ) -> None:
     config = copy.deepcopy(_CLEAN_CONFIG)
     malform(config)
-    assert containment_violations(config) != []
+    assert containment_violations(config, _LAB_DIR) != []
 
 
 @pytest.mark.parametrize(
@@ -566,7 +571,7 @@ def test_malformed_config_is_a_containment_violation_not_an_exception(
 def test_list_form_environment_and_networks_are_read_like_mappings_for_containment(
     service: str, key: str, value: list[str], expected: int
 ) -> None:
-    violations = containment_violations(_planted(service, key, value))
+    violations = containment_violations(_planted(service, key, value), _LAB_DIR)
     assert len(violations) == expected, violations
     if expected:
         assert service in violations[0]
