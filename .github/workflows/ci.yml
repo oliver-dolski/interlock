@@ -1,0 +1,44 @@
+# CI for interlock.
+#
+# The unit suite runs on both ubuntu-latest and windows-latest because the people who will
+# run this tool mostly sit on Windows: a suite green only on Linux would not prove that the
+# CLI and the report writers work where they are used. Every command is a plain
+# `python -m ...`, so it behaves the same under bash on Ubuntu and pwsh on Windows.
+#
+# The lab (Docker Compose: a LibOSDP peripheral, a control panel and the attacker container)
+# runs only on ubuntu-latest. Hosted Windows runners run Windows containers only, so the
+# Linux lab images cannot start there; that is a runner limit, not a gap in the matrix.
+#
+# Every action is pinned to an exact release tag that was checked to exist, never to a
+# moving major tag such as `@v7`: a major tag is a pointer the publisher can move at any
+# time, and some publishers stop publishing major tags at all, which makes the job fail to
+# resolve. Only first-party actions/* are used, the token is read-only and no secret is read.
+
+name: ci
+
+# Quoted on purpose: YAML 1.1 parsers read a bare `on` as the boolean true. GitHub Actions
+# accepts both forms.
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.15"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest -q -m "not lab"
