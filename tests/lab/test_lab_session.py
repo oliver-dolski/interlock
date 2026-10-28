@@ -11,6 +11,10 @@ Uses its own compose project, interlock-assess, so it never collides with the in
 project the rest of this suite uses. Adds no published port: the capture is read via
 ``docker compose exec`` exactly as test_attacks_sniff.py does, so SAFE-01 containment is
 unchanged.
+
+A second test resolves the base file plus every allowed override with the live Docker CLI and
+asserts the containment preflight finds nothing (WR-07): the rules the assessment enforces
+before a run accept every file set it actually brings up.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import pytest
 
 from interlock.osdp import tap_capture
 from interlock.osdp.attacks.sniff import decode_chunks
-from interlock.osdp.lab_session import DEFAULT_PROJECT, LabSession
+from interlock.osdp.lab_session import ALLOWED_OVERRIDES, DEFAULT_PROJECT, LabSession
 from interlock.osdp.transport import Direction
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -60,3 +64,11 @@ def test_lab_session_drives_reads_and_tears_down_the_real_lab() -> None:
         check=True,
     )
     assert left.stdout.strip() == "", f"containers left behind: {left.stdout!r}"
+
+
+@pytest.mark.lab
+def test_every_bundled_compose_file_set_is_contained() -> None:
+    session = LabSession(REPO_ROOT)
+    for override in sorted(ALLOWED_OVERRIDES):
+        violations = session.check_containment((override,))
+        assert violations == [], f"{override}: {violations}"

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
+import json
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
@@ -35,6 +37,7 @@ from interlock.osdp.lab_session import (
     DEFAULT_PROJECT,
     LabError,
     LabSession,
+    containment_violations,
     docker_available,
     find_lab_dir,
     make_runner,
@@ -398,6 +401,80 @@ def test_make_runner_runs_a_list_argv_from_the_lab_dir_without_a_shell(
     assert kwargs["errors"] == "replace"
     assert kwargs["check"] is False
     assert not kwargs.get("shell")
+
+
+# --- containment rules (WR-07, T-06-38) ---------------------------------------------------
+
+# The shape of ``docker compose config --format json`` over the bundled files (probed on
+# v5.5.0), with a placeholder bind source: a real dump carries absolute host paths.
+_CLEAN_CONFIG: dict[str, Any] = {
+    "name": "interlock-assess",
+    "networks": {"labnet": {"name": "interlock-assess_labnet", "internal": True}},
+    "services": {
+        "pd": {"networks": {"labnet": None}, "environment": {"LAB_SCENARIO": "cleartext"}},
+        "attacker": {
+            "networks": {"labnet": None},
+            "environment": {"ATTACKER_UPSTREAM": "pd:10000", "PYTHONPATH": "/app/src"},
+            "volumes": [
+                {"type": "bind", "source": "/lab/src", "target": "/app/src", "read_only": True}
+            ],
+        },
+        "cp": {
+            "networks": {"labnet": None},
+            "environment": {"LAB_SCENARIO": "cleartext", "CP_UPSTREAM": "attacker:10000"},
+        },
+    },
+}
+
+
+def _planted(service: str, key: str, value: object) -> dict[str, Any]:
+    """Return a deep copy of ``_CLEAN_CONFIG`` with ``key: value`` set on one service."""
+    config = copy.deepcopy(_CLEAN_CONFIG)
+    config["services"][service][key] = value
+    return config
+
+
+def test_clean_config_has_no_containment_violation() -> None:
+    assert containment_violations(_CLEAN_CONFIG) == []
+
+
+@pytest.mark.parametrize(
+    ("service", "key", "value"),
+    [
+        ("attacker", "ports", ["8000:10000"]),
+        ("pd", "expose", ["10000"]),
+        ("pd", "devices", ["/dev/ttyUSB0:/dev/ttyUSB0"]),
+        ("attacker", "privileged", True),
+        ("cp", "network_mode", "host"),
+        ("attacker", "cap_add", ["NET_ADMIN"]),
+        ("pd", "pid", "host"),
+        ("cp", "ipc", "host"),
+    ],
+)
+def test_containment_violation_per_service_key(service: str, key: str, value: object) -> None:
+    violations = containment_violations(_planted(service, key, value))
+    assert len(violations) == 1, violations
+    assert service in violations[0]
+    assert key in violations[0]
+
+
+@pytest.mark.parametrize(("key", "value"), [("privileged", False), ("cap_add", [])])
+def test_falsy_service_keys_are_not_containment_violations(key: str, value: object) -> None:
+    assert containment_violations(_planted("attacker", key, value)) == []
+
+
+def test_check_containment_reports_a_planted_device_end_to_end(tmp_path: Path) -> None:
+    planted = _planted("pd", "devices", ["/dev/ttyUSB0:/dev/ttyUSB0"])
+    runner = _Runner(stdout={"config": json.dumps(planted)})
+
+    violations = _session(tmp_path, runner).check_containment(("docker-compose.spoof.yml",))
+
+    assert runner.argvs == [
+        [*_base(tmp_path, "docker-compose.spoof.yml"), "config", "--format", "json"]
+    ]
+    assert len(violations) == 1, violations
+    assert "pd" in violations[0]
+    assert "devices" in violations[0]
 
 
 # --- lab-only by construction (D-04) -------------------------------------------------------
