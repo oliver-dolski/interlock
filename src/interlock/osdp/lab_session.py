@@ -210,7 +210,8 @@ def _volumes_reason(volumes: object, lab_dir: Path) -> str | None:
         if not isinstance(volume, Mapping):
             return "is not a list of mounts"
         kind = volume.get("type")
-        if kind not in _MOUNT_TYPES:
+        # A list or dict is unhashable, so test the type before the set lookup.
+        if not isinstance(kind, str) or kind not in _MOUNT_TYPES:
             return "holds a mount that is not bind, volume or tmpfs"
         if kind != "bind":
             continue
@@ -245,7 +246,7 @@ def _service_violations(
         if extra not in _SERVICE_KEYS and extra not in _ESCAPE_KEY_NAMES
     ]
     networks = _as_mapping(service.get("networks"))
-    if networks is None or set(networks) - {_LAB_NETWORK}:
+    if networks is None or set(networks) != {_LAB_NETWORK}:
         violations.append(f"service {name}: networks is not {_LAB_NETWORK} only")
     mounts = _volumes_reason(service.get("volumes", []), lab_dir)
     if mounts is not None:
