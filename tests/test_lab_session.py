@@ -25,7 +25,7 @@ import copy
 import json
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -475,6 +475,142 @@ def test_check_containment_reports_a_planted_device_end_to_end(tmp_path: Path) -
     assert len(violations) == 1, violations
     assert "pd" in violations[0]
     assert "devices" in violations[0]
+
+
+def _cp_on_default(config: dict[str, Any]) -> None:
+    config["services"]["cp"]["networks"]["default"] = None
+
+
+def _labnet_not_internal(config: dict[str, Any]) -> None:
+    config["networks"]["labnet"]["internal"] = False
+
+
+def _labnet_internal_missing(config: dict[str, Any]) -> None:
+    del config["networks"]["labnet"]["internal"]
+
+
+def _writable_bind(config: dict[str, Any]) -> None:
+    del config["services"]["attacker"]["volumes"][0]["read_only"]
+
+
+def _cp_past_the_attacker(config: dict[str, Any]) -> None:
+    config["services"]["cp"]["environment"]["CP_UPSTREAM"] = "pd:10000"
+
+
+@pytest.mark.parametrize(
+    ("breach", "where", "key"),
+    [
+        (_cp_on_default, "cp", "networks"),
+        (_labnet_not_internal, "labnet", "internal"),
+        (_labnet_internal_missing, "labnet", "internal"),
+        (_writable_bind, "attacker", "volumes"),
+        (_cp_past_the_attacker, "cp", "CP_UPSTREAM"),
+    ],
+)
+def test_containment_violation_per_topology_breach(
+    breach: Callable[[dict[str, Any]], None], where: str, key: str
+) -> None:
+    config = copy.deepcopy(_CLEAN_CONFIG)
+    breach(config)
+    violations = containment_violations(config)
+    assert len(violations) == 1, violations
+    assert where in violations[0]
+    assert key in violations[0]
+
+
+def test_containment_violation_never_names_a_host_path() -> None:
+    source = "/home/operator/interlock/src"
+    volumes = [{"type": "bind", "source": source, "target": "/app/src"}]
+    violations = containment_violations(_planted("attacker", "volumes", volumes))
+    assert len(violations) == 1, violations
+    assert "attacker" in violations[0] and "volumes" in violations[0]
+    assert not any(source in text or "/home/operator" in text for text in violations)
+
+
+def _no_services(config: dict[str, Any]) -> None:
+    del config["services"]
+
+
+def _services_a_list(config: dict[str, Any]) -> None:
+    config["services"] = ["pd", "attacker", "cp"]
+
+
+def _service_a_string(config: dict[str, Any]) -> None:
+    config["services"]["pd"] = "pd"
+
+
+def _volume_a_string(config: dict[str, Any]) -> None:
+    config["services"]["attacker"]["volumes"] = ["./src:/app/src"]
+
+
+@pytest.mark.parametrize(
+    "malform", [_no_services, _services_a_list, _service_a_string, _volume_a_string]
+)
+def test_malformed_config_is_a_containment_violation_not_an_exception(
+    malform: Callable[[dict[str, Any]], None],
+) -> None:
+    config = copy.deepcopy(_CLEAN_CONFIG)
+    malform(config)
+    assert containment_violations(config) != []
+
+
+@pytest.mark.parametrize(
+    ("service", "key", "value", "expected"),
+    [
+        ("cp", "environment", ["LAB_SCENARIO=cleartext", "CP_UPSTREAM=pd:10000"], 1),
+        ("cp", "environment", ["LAB_SCENARIO=cleartext", "CP_UPSTREAM=attacker:10000"], 0),
+        ("pd", "networks", ["labnet"], 0),
+        ("pd", "networks", ["labnet", "default"], 1),
+    ],
+)
+def test_list_form_environment_and_networks_are_read_like_mappings_for_containment(
+    service: str, key: str, value: list[str], expected: int
+) -> None:
+    violations = containment_violations(_planted(service, key, value))
+    assert len(violations) == expected, violations
+    if expected:
+        assert service in violations[0]
+
+
+def test_check_containment_turns_a_failed_config_into_a_bounded_violation(
+    tmp_path: Path,
+) -> None:
+    stderr = "x" * 5000 + "service pd: no such file"
+    runner = _Runner(returncodes={"config": 1}, stderr={"config": stderr})
+
+    violations = _session(tmp_path, runner).check_containment(("docker-compose.tap.yml",))
+
+    assert len(violations) == 1, violations
+    assert "config" in violations[0] and "exit 1" in violations[0]
+    assert violations[0].endswith("service pd: no such file")
+    assert len(violations[0]) < 2100
+
+
+def test_check_containment_turns_output_that_is_not_json_into_a_violation(
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(stdout={"config": "not json"})
+    violations = _session(tmp_path, runner).check_containment(("docker-compose.tap.yml",))
+    assert len(violations) == 1, violations
+    assert "JSON" in violations[0]
+
+
+def test_check_containment_rejects_a_foreign_override_before_any_command(
+    tmp_path: Path,
+) -> None:
+    runner = _Runner(stdout={"config": json.dumps(_CLEAN_CONFIG)})
+    with pytest.raises(ValueError, match="not allowed"):
+        _session(tmp_path, runner).check_containment(("docker-compose.vuln.yml",))
+    assert runner.calls == []
+
+
+def test_containment_sentence_names_every_rule() -> None:
+    sentence = lab_session.containment_sentence(
+        ["docker-compose.yml", *sorted(ALLOWED_OVERRIDES)]
+    )
+    assert len(lab_session.CONTAINMENT_RULES) >= 7
+    for rule in lab_session.CONTAINMENT_RULES:
+        assert rule in sentence, rule
 
 
 # --- lab-only by construction (D-04) -------------------------------------------------------
