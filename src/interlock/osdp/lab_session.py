@@ -74,7 +74,13 @@ CONTAINMENT_RULES: tuple[str, ...] = (
     "no network_mode",
     "no added capabilities",
     "no host pid or ipc namespace",
+    "every service on labnet only",
+    "every bind mount read-only",
+    "cp upstream pinned to the attacker",
 )
+
+# The one network every service may join (docker-compose.yml).
+_LAB_NETWORK = "labnet"
 
 # Service keys that reach past the lab when set to any truthy value, with the reason a
 # violation gives. ``ports`` publishes to the host; the others hand a container host devices,
@@ -137,12 +143,50 @@ def _check_overrides(overrides: Sequence[str]) -> None:
                              f"one of {sorted(ALLOWED_OVERRIDES)}")
 
 
+def _as_mapping(section: object) -> Mapping[object, object] | None:
+    """Read a compose section given as a mapping or as a list (None when it is neither).
+
+    Compose may print ``environment`` as ``KEY=VALUE`` strings and a service's ``networks`` as
+    bare names; both become the mapping form (a name without ``=`` maps to None).
+    """
+    if isinstance(section, Mapping):
+        return section
+    if not isinstance(section, list) or not all(isinstance(item, str) for item in section):
+        return None
+    pairs = [item.partition("=") for item in section]
+    return {key: value if sep else None for key, sep, value in pairs}
+
+
+def _service_violations(name: object, service: Mapping[object, object]) -> list[str]:
+    """Return the containment violations of one resolved service, naming only keys."""
+    violations: list[str] = []
+    for key, reason in _ESCAPE_KEYS:
+        if service.get(key):
+            violations.append(f"service {name}: {key} {reason}")
+    networks = _as_mapping(service.get("networks"))
+    if networks is None or set(networks) - {_LAB_NETWORK}:
+        violations.append(f"service {name}: networks is not {_LAB_NETWORK} only")
+    volumes = service.get("volumes", [])
+    if not isinstance(volumes, list) or not all(
+        isinstance(volume, Mapping)
+        and (volume.get("type") != "bind" or volume.get("read_only") is True)
+        for volume in volumes
+    ):
+        violations.append(f"service {name}: volumes holds a bind mount that is not read-only")
+    if name == "cp":
+        environment = _as_mapping(service.get("environment"))
+        pinned = _PINNED_TOPOLOGY["CP_UPSTREAM"]
+        if environment is None or environment.get("CP_UPSTREAM") != pinned:
+            violations.append(f"service cp: environment CP_UPSTREAM is not {pinned}")
+    return violations
+
+
 def containment_violations(config: Mapping[str, object]) -> list[str]:
     """Return every containment rule a resolved ``docker compose config`` document breaks.
 
     Pure and total: a missing or malformed section is itself a violation, never an exception.
     Each text names the network or service and the key, never a value, so no host path from
-    the resolved config can reach a message or a report.
+    the resolved config (a bind source) can reach a message or a report.
     """
     violations: list[str] = []
     networks = config.get("networks")
@@ -157,12 +201,12 @@ def containment_violations(config: Mapping[str, object]) -> list[str]:
         violations.append("services: missing or not a mapping")
     else:
         for name, service in services.items():
-            if not isinstance(service, Mapping):
+            if isinstance(service, Mapping):
+                violations += _service_violations(name, service)
+            else:
                 violations.append(f"service {name}: not a mapping")
-                continue
-            for key, reason in _ESCAPE_KEYS:
-                if service.get(key):
-                    violations.append(f"service {name}: {key} {reason}")
+        if "cp" not in services:
+            violations.append("service cp: missing, so its upstream cannot be checked")
     return violations
 
 
