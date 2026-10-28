@@ -1413,7 +1413,7 @@ def test_replay_of_the_live_card_read_is_vulnerable(lab_dir: Path) -> None:
     assert "replay precondition met" in finding.title
     assert f"{card_reads} clear-text REPLY_RAW" in finding.evidence
     assert "host unit tests" in finding.evidence
-    assert not hasattr(assessment, "REPLAY_LIVE_NOTE")
+    assert not [name for name in vars(assessment) if name.endswith("_LIVE_NOTE")]
     assert _bring_ups(fake) == [("cleartext", ("docker-compose.replay.yml",))]
     assert _touch_argv(lab_dir, "docker-compose.replay.yml", _REPLAY_TRIGGER) in fake.argvs
     assert fake.touches == [_REPLAY_TRIGGER]

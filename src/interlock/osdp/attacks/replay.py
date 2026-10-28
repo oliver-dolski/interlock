@@ -15,6 +15,10 @@ new frame from attacker-chosen fields; replay never invents content.
   byte-for-byte (no text normalization, no re-crafting) via ``inject`` and emits a
   Finding only on an observed locked->unlocked transition; an empty ``captured``
   performs no injection and returns ``[]``.
+- ``inferred_replay_finding(card_reads)`` is the finding the assessment reports from a live
+  run: same id and technique, but HIGH and worded as a met replay precondition, because the
+  live relay proves the unlock through spoof's rewrite and only the host tests prove the
+  byte-exact re-injection.
 
 Door-open is not visible on the wire, so the live demonstration proves itself against
 the same single lab PD lock-state signal (D-05) spoof uses, re-triggered through
@@ -331,6 +335,40 @@ def run_replay(
     ]
 
 
+def inferred_replay_finding(card_reads: int) -> Finding:
+    """Return the replay finding for what a live assessment run actually demonstrates.
+
+    The live clear-text lab CP stops after its first card read, so the live relay cannot show
+    the PD acting on a re-sent REPLY_RAW; it proves the unlock through the same POLL-to-CMD_OUT
+    rewrite as spoof. The finding therefore keeps ``run_replay``'s id and technique but is
+    HIGH, is titled as a met precondition, and names what ran live (``card_reads`` captured
+    card reads, the in-path unlock) apart from what only the host tests prove.
+    """
+    return Finding(
+        id="ATK-05a-replay-card-exchange",
+        title=(
+            "Clear-text card read is reusable and the bus accepts an in-path unlock "
+            "(replay precondition met)"
+        ),
+        severity=Severity.HIGH,
+        evidence=(
+            f"{card_reads} clear-text REPLY_RAW card read(s) were captured live from the bus "
+            "with no MAC and no freshness, so the exact bytes can be presented again. On the "
+            "live bus the PD's lock-state signal went LOCKED -> UNLOCKED after the in-path "
+            "relay's POLL-to-CMD_OUT rewrite (the ATK-08 mechanism). The byte-exact "
+            "re-injection of the captured REPLY_RAW is proven by host unit tests in "
+            "tests/osdp/test_attacks_replay.py, not on the live bus."
+        ),
+        attack_technique=_TECHNIQUE,
+        attack_technique_ics=_ICS_TECHNIQUE,
+        remediation=(
+            "Enable OSDP Secure Channel with MAC+encryption (SCS_17/18) and reject "
+            "replayed sequence numbers; a clear-text bus with no freshness guarantee "
+            "lets any captured card-presentation exchange be reused verbatim."
+        ),
+    )
+
+
 def serve_replay_lab(target_port: int, upstream: tuple[str, int]) -> None:
     """Serve the inline replay-of-card-exchange rewrite relay against the lab bus (blocking).
 
@@ -372,14 +410,16 @@ def main() -> None:
         serve_cve_replay_lab(_LAB_PORT, upstream)
         return
 
-    from interlock.osdp.attacks.spoof import unlock_transform
+    from interlock.osdp.attacks.spoof import announce_inject, unlock_transform
 
     print(
         f"interlock: replay (cleartext) MITM listening on 0.0.0.0:{_LAB_PORT} "
         f"upstream={upstream[0]}:{upstream[1]}",
         flush=True,
     )
-    TCPTap(_LAB_PORT, upstream).serve_rewrite(unlock_transform(armed=_TRIGGER_PATH.exists))
+    TCPTap(_LAB_PORT, upstream).serve_rewrite(
+        unlock_transform(armed=_TRIGGER_PATH.exists, on_inject=announce_inject)
+    )
 
 
 def register(app: typer.Typer) -> None:

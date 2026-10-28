@@ -32,8 +32,8 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from dataclasses import dataclass
+from pathlib import Path, PurePath
 
 from rich.console import Console
 from rich.table import Table
@@ -490,9 +490,14 @@ def _unlocked(lab: lab_session.LabHandle) -> bool:
     return LOCK_UNLOCKED in lab.logs("pd")
 
 
-def _arm(lab: lab_session.LabHandle, trigger: Path) -> None:
-    """Touch ``trigger`` in the attacker, arming its relay; a failed touch is a ``LabError``."""
-    path = PurePosixPath(trigger).as_posix()
+def _arm(lab: lab_session.LabHandle, trigger: PurePath) -> None:
+    """Touch ``trigger`` in the attacker, arming its relay; a failed touch is a ``LabError``.
+
+    The attacker is Linux whatever the host: ``as_posix()`` turns a Windows path into
+    ``/tmp/...`` on every Python, where re-wrapping it in ``PurePosixPath`` kept a backslash
+    on 3.11.
+    """
+    path = trigger.as_posix()
     result = lab.compose("exec", "-T", "attacker", "touch", path)
     if result.returncode != 0:
         raise LabError(
@@ -510,7 +515,7 @@ def _require_locked(lab: lab_session.LabHandle) -> None:
         )
 
 
-def _arm_once(lab: lab_session.LabHandle, trigger: Path) -> Callable[..., None]:
+def _arm_once(lab: lab_session.LabHandle, trigger: PurePath) -> Callable[..., None]:
     """Return an inject that arms ``trigger`` on its first call and waits for the unlock.
 
     The relay serves the live rewrite itself; later calls (one per captured frame) only
@@ -597,15 +602,6 @@ _REPLAY_PROFILE = "cleartext"
 _REPLAY_OVERRIDES = ("docker-compose.replay.yml",)
 
 
-# The replay verdict's evidence describes the byte-exact re-injection; in this run the live
-# unlock came through the shared relay rewrite, so the finding says so next to its evidence.
-REPLAY_LIVE_NOTE = (
-    "Assessment run: the live unlock was triggered through the in-path relay's shared "
-    "POLL-to-CMD_OUT rewrite on the replay trigger; the byte-exact re-injection of the "
-    "captured REPLY_RAW is proven by host unit tests, not on the live bus."
-)
-
-
 def _replay(session: LabSession, context: dict[str, object]) -> StepOutput:
     """Replay the card read captured live by sniff-enumerate and watch the PD's lock state."""
     frames = context.get("cleartext_frames")
@@ -621,18 +617,17 @@ def _replay(session: LabSession, context: dict[str, object]) -> StepOutput:
         findings = replay.run_replay(
             captured, _arm_once(lab, replay._TRIGGER_PATH), lambda: _unlocked(lab)
         )
-    if findings:
-        return StepOutput(
-            findings=tuple(
-                replace(finding, evidence=f"{finding.evidence} {REPLAY_LIVE_NOTE}")
-                for finding in findings
-            ),
-            detail=(
-                f"{len(captured)} card read(s) captured live; the PD was locked before arming "
-                "and logged UNLOCKED after"
-            ),
-        )
-    return StepOutput(findings=(), detail=_NO_TRANSITION)
+        if not findings:
+            return _clean_or_inconclusive(lab)
+    # run_replay's own finding describes a byte-exact re-injection the live relay does not
+    # perform, so the report carries the finding for what this run demonstrated.
+    return StepOutput(
+        findings=(replay.inferred_replay_finding(len(captured)),),
+        detail=(
+            f"{len(captured)} card read(s) captured live; the PD was locked before arming "
+            "and logged UNLOCKED after"
+        ),
+    )
 
 
 # cve-2024-52288-fixed: the sc-scbkd lab on the fixed LibOSDP core with the inline cve relay.
@@ -775,7 +770,8 @@ STEPS: tuple[Step, ...] = (
             "proof via the in-path relay, which serves the same POLL-to-CMD_OUT rewrite as "
             "spoof on the replay trigger; the byte-exact re-injection of the captured "
             "REPLY_RAW is proven by host unit tests (tests/osdp/test_attacks_replay.py), not "
-            "on the live bus"
+            "on the live bus; a clean result needs the relay's own injection line in the "
+            "attacker log"
         ),
         clean_detail=_NO_TRANSITION,
         attacks=(("replay", "ATK-05a-"),),

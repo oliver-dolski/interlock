@@ -10,7 +10,11 @@ not_vulnerable, the latter quoting the fixed core's "Out of order REPLY_RMAC_I" 
 The test pins the finding ids each vulnerable step must report, that no fuzz finding and no
 CVE-2024-52288 replay finding appear, that every finding carries severity, evidence, technique
 and remediation with the technique taken from ``attack_map.MAPPINGS`` (ASSESS-02), that the
-report records ATT&CK v20.0 and that both files carry the authorized-use notice. On a failure
+report records ATT&CK v20.0 and that both files carry the authorized-use notice. It also pins
+the severities of the two active unlock steps: spoof's live-proven unlock is critical, and the
+replay finding is high, because the live run proves its precondition and the unlock through
+spoof's rewrite while the byte-exact re-injection is proven by host tests only. The Scope must
+state that containment was checked before the run, in the Markdown and in the JSON. On a failure
 the message carries every step's key, status and detail, so one live run is enough to diagnose.
 One test, one real run: about 5-8 minutes on a warm Docker cache.
 
@@ -53,6 +57,8 @@ _EXPECTED_FINDING_IDS = {
     "ATK-05a-replay-card-exchange",
 }
 _FORBIDDEN_PREFIXES = ("ATK-07-fuzz-", "ATK-05b-")
+_EXPECTED_SEVERITIES = {"ATK-08-spoof-unlock": "critical", "ATK-05a-replay-card-exchange": "high"}
+_CONTAINMENT_CHECKED = "**Containment:** checked before the run"
 _RMAC_I_REJECTED = "Out of order REPLY_RMAC_I"
 
 # Finding-id prefix -> the attack key whose technique the finding must cite.
@@ -91,6 +97,8 @@ def test_osdp_assess_runs_the_real_lab_end_to_end(tmp_path: Path) -> None:
     assert document["notice"] == report.AUTHORIZED_USE_NOTICE
     assert document["attack_version"] == attack_map.ATTACK_VERSION == "20.0"
     assert "MITRE ATT&CK v20.0" in markdown
+    assert _CONTAINMENT_CHECKED in markdown, context
+    assert document["containment"]["checked"] is True, context
 
     statuses = {step["key"]: step["status"] for step in steps}
     assert statuses == _EXPECTED_STATUSES, context
@@ -112,6 +120,10 @@ def test_osdp_assess_runs_the_real_lab_end_to_end(tmp_path: Path) -> None:
         attack = _attack_of(fid)
         assert finding["attack_technique"] == attack_map.MAPPINGS[attack].enterprise, fid
         assert fid in markdown, fid
+
+    severities = {finding["id"]: finding["severity"] for finding in document["findings"]}
+    for fid, severity in _EXPECTED_SEVERITIES.items():
+        assert severities.get(fid) == severity, f"{fid} is {severities.get(fid)}\n{context}"
 
     for step in steps:
         assert set(step["finding_ids"]) <= finding_ids, step["key"]
