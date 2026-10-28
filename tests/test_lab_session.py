@@ -613,7 +613,239 @@ def test_containment_sentence_names_every_rule() -> None:
         assert rule in sentence, rule
 
 
-# --- lab-only by construction (D-04) -------------------------------------------------------
+# --- deny by default: keys, mount sources, builds and networks (WR-07 follow-up) ----------
+
+# A host path planted in values: no violation text may carry it (T-06-40).
+_HOST = "/home/operator"
+
+# ``docker compose config --format json`` over docker-compose.yml plus each allowed override,
+# captured on Compose v5.5.0 with the lab dir replaced by @LAB_DIR@.
+_RESOLVED_FIXTURE = Path(__file__).parent / "fixtures" / "lab_compose_config.json"
+
+
+def _with_lab_dir(node: Any, lab: Path) -> Any:
+    """Return ``node`` with every @LAB_DIR@ in its strings replaced by ``lab``."""
+    if isinstance(node, dict):
+        return {key: _with_lab_dir(value, lab) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_with_lab_dir(value, lab) for value in node]
+    if isinstance(node, str):
+        return node.replace("@LAB_DIR@", str(lab))
+    return node
+
+
+def _lab(tmp_path: Path) -> Path:
+    lab = tmp_path / "lab"
+    (lab / "src").mkdir(parents=True)
+    return lab
+
+
+def _in_lab(lab: Path) -> dict[str, Any]:
+    """Return ``_CLEAN_CONFIG`` with its bind source inside ``lab``, the session's lab dir."""
+    config = copy.deepcopy(_CLEAN_CONFIG)
+    config["services"]["attacker"]["volumes"][0]["source"] = str(lab / "src")
+    return config
+
+
+def _checked(lab: Path, config: Mapping[str, Any]) -> list[str]:
+    """Run ``check_containment`` over ``config`` as the resolved output for ``lab``."""
+    runner = _Runner(stdout={"config": json.dumps(config)})
+    return _session(lab, runner).check_containment(("docker-compose.tap.yml",))
+
+
+def _assert_one_naming(violations: list[str], where: str, key: str) -> None:
+    assert len(violations) == 1, violations
+    assert where in violations[0] and key in violations[0], violations
+    assert _HOST not in violations[0], violations
+
+
+def test_bind_in_lab_config_is_contained(tmp_path: Path) -> None:
+    lab = _lab(tmp_path)
+    assert _checked(lab, _in_lab(lab)) == []
+
+
+@pytest.mark.parametrize(
+    ("service", "key", "value"),
+    [
+        ("attacker", "security_opt", ["apparmor=unconfined", "seccomp=unconfined"]),
+        ("pd", "userns_mode", "host"),
+        ("cp", "uts", "host"),
+        ("attacker", "cgroup", "host"),
+        ("pd", "device_cgroup_rules", ["c 188:* rmw"]),
+        ("attacker", "volumes_from", ["helper"]),
+        ("cp", "use_api_socket", True),
+        ("attacker", "logging", {"driver": "syslog", "options": {"syslog-address": _HOST}}),
+        ("pd", "x-anything", f"{_HOST}/secret"),
+    ],
+)
+def test_service_key_outside_the_allow_list_is_a_containment_violation(
+    tmp_path: Path, service: str, key: str, value: object
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["services"][service][key] = value
+    _assert_one_naming(_checked(lab, config), service, key)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "/var/run/docker.sock",
+        f"{_HOST}/.ssh",
+        "@OUTSIDE@",
+        "@LAB@/src/../../outside",
+        "@LAB@/escape",
+    ],
+)
+def test_read_only_bind_from_outside_the_lab_dir_is_a_containment_violation(
+    tmp_path: Path, source: str
+) -> None:
+    lab = _lab(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if source.endswith("/escape"):
+        try:
+            (lab / "escape").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:  # Windows without the symlink privilege
+            pytest.skip(f"cannot create a symlink here: {exc}")
+    config = _in_lab(lab)
+    volume = config["services"]["attacker"]["volumes"][0]
+    volume["source"] = source.replace("@OUTSIDE@", str(outside)).replace("@LAB@", str(lab))
+    assert volume["read_only"] is True
+    violations = _checked(lab, config)
+    _assert_one_naming(violations, "attacker", "volumes")
+    assert not any(str(tmp_path) in text or "docker.sock" in text for text in violations)
+
+
+@pytest.mark.parametrize("relative", ["src", ".", "lab/osdp"])
+def test_read_only_bind_from_inside_the_lab_dir_is_contained(
+    tmp_path: Path, relative: str
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["services"]["attacker"]["volumes"][0]["source"] = str(lab / relative)
+    assert _checked(lab, config) == []
+
+
+def test_tmpfs_and_plain_named_volume_mounts_are_contained(tmp_path: Path) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["volumes"] = {"captures": {"name": "interlock-assess_captures"}}
+    config["services"]["attacker"]["volumes"] += [
+        {"type": "volume", "source": "captures", "target": "/app/capture"},
+        {"type": "tmpfs", "target": "/tmp"},
+    ]
+    assert _checked(lab, config) == []
+
+
+def test_mount_type_beyond_bind_volume_and_tmpfs_is_a_containment_violation(
+    tmp_path: Path,
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["services"]["pd"]["volumes"] = [
+        {"type": "npipe", "source": r"\\.\pipe\docker_engine", "target": r"\\.\pipe\docker_engine"}
+    ]
+    violations = _checked(lab, config)
+    _assert_one_naming(violations, "pd", "volumes")
+    assert not any("pipe" in text for text in violations)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("external", True),
+        ("driver", "nfs"),
+        ("driver_opts", {"type": "none", "o": "bind", "device": _HOST}),
+    ],
+)
+def test_named_volume_backed_by_anything_but_a_plain_volume_is_a_containment_violation(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["volumes"] = {"captures": {"name": "interlock-assess_captures", key: value}}
+    config["services"]["attacker"]["volumes"].append(
+        {"type": "volume", "source": "captures", "target": "/app/capture"}
+    )
+    _assert_one_naming(_checked(lab, config), "captures", key)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("external", True),
+        ("driver", "macvlan"),
+        ("driver_opts", {"parent": "eth0"}),
+        ("attachable", True),
+    ],
+)
+def test_network_that_is_not_a_plain_compose_bridge_is_a_containment_violation(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["networks"]["labnet"][key] = value
+    _assert_one_naming(_checked(lab, config), "labnet", key)
+
+
+def test_explicit_bridge_driver_is_contained(tmp_path: Path) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["networks"]["labnet"]["driver"] = "bridge"
+    assert _checked(lab, config) == []
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        {"context": "@LAB_DIR@", "dockerfile": "Dockerfile", "network": "host"},
+        {"context": "@LAB_DIR@", "dockerfile": "Dockerfile", "ssh": ["default"]},
+        {"context": "@LAB_DIR@", "dockerfile": "Dockerfile", "additional_contexts": {"h": _HOST}},
+        {"context": _HOST, "dockerfile": "Dockerfile"},
+        {"context": "@LAB_DIR@", "dockerfile": f"{_HOST}/Dockerfile"},
+        "@LAB_DIR@",
+    ],
+)
+def test_build_beyond_a_plain_lab_dir_build_is_a_containment_violation(
+    tmp_path: Path, build: object
+) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["services"]["cp"]["build"] = _with_lab_dir(build, lab)
+    _assert_one_naming(_checked(lab, config), "cp", "build")
+
+
+def test_unlisted_top_level_section_is_a_containment_violation(tmp_path: Path) -> None:
+    lab = _lab(tmp_path)
+    config = _in_lab(lab)
+    config["secrets"] = {"shadow": {"file": "/etc/shadow"}}
+    violations = _checked(lab, config)
+    assert len(violations) == 1, violations
+    assert "secrets" in violations[0]
+    assert "/etc/shadow" not in violations[0]
+
+
+def test_every_bundled_compose_file_set_resolves_contained(tmp_path: Path) -> None:
+    lab = _lab(tmp_path)
+    resolved = json.loads(_RESOLVED_FIXTURE.read_text(encoding="utf-8"))
+    assert set(resolved) == ALLOWED_OVERRIDES
+    for override, config in sorted(resolved.items()):
+        runner = _Runner(stdout={"config": json.dumps(_with_lab_dir(config, lab))})
+        violations = _session(lab, runner).check_containment((override,))
+        assert violations == [], f"{override}: {violations}"
+
+
+def test_containment_sentence_claims_only_what_the_rules_check() -> None:
+    sentence = lab_session.containment_sentence(
+        ["docker-compose.yml", *sorted(ALLOWED_OVERRIDES)]
+    )
+    assert "no real hardware is reachable" not in sentence
+    assert "lab dir" in sentence
+    assert "not covered" in sentence
+
+
+# --- lab-only by construction (D-04)-------------------------------------------------------
 
 _FORBIDDEN_IMPORT_PARTS = ("safety", "serial", "open_serial_endpoint", "open_physical_endpoint")
 

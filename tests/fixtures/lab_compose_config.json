@@ -1,0 +1,544 @@
+{
+  "docker-compose.cve.yml": {
+    "name": "interlock-assess",
+    "networks": {
+      "labnet": {
+        "internal": true,
+        "ipam": {},
+        "name": "interlock-assess_labnet"
+      }
+    },
+    "services": {
+      "attacker": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "-m",
+          "interlock.osdp.attacks.replay"
+        ],
+        "depends_on": {
+          "pd": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "ATTACKER_UPSTREAM": "pd:10000",
+          "ATTACK_MODE": "cve",
+          "PYTHONPATH": "/app/src"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "volumes": [
+          {
+            "bind": {},
+            "read_only": true,
+            "source": "@LAB_DIR@/src",
+            "target": "/app/src",
+            "type": "bind"
+          }
+        ],
+        "working_dir": "/app"
+      },
+      "cp": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "cp_driver.py"
+        ],
+        "depends_on": {
+          "attacker": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "CP_UPSTREAM": "attacker:10000",
+          "CVE_LAB": "1",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      },
+      "pd": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "pd_driver.py"
+        ],
+        "entrypoint": null,
+        "environment": {
+          "CVE_LAB": "1",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      }
+    }
+  },
+  "docker-compose.downgrade.yml": {
+    "name": "interlock-assess",
+    "networks": {
+      "labnet": {
+        "internal": true,
+        "ipam": {},
+        "name": "interlock-assess_labnet"
+      }
+    },
+    "services": {
+      "attacker": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "-m",
+          "interlock.osdp.attacks.downgrade"
+        ],
+        "depends_on": {
+          "pd": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "ATTACKER_UPSTREAM": "pd:10000",
+          "PYTHONPATH": "/app/src"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "volumes": [
+          {
+            "bind": {},
+            "read_only": true,
+            "source": "@LAB_DIR@/src",
+            "target": "/app/src",
+            "type": "bind"
+          }
+        ],
+        "working_dir": "/app"
+      },
+      "cp": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "cp_driver.py"
+        ],
+        "depends_on": {
+          "attacker": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "CP_UPSTREAM": "attacker:10000",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      },
+      "pd": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "pd_driver.py"
+        ],
+        "entrypoint": null,
+        "environment": {
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      }
+    }
+  },
+  "docker-compose.fuzz.yml": {
+    "name": "interlock-assess",
+    "networks": {
+      "labnet": {
+        "internal": true,
+        "ipam": {},
+        "name": "interlock-assess_labnet"
+      }
+    },
+    "services": {
+      "attacker": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "sleep",
+          "infinity"
+        ],
+        "depends_on": {
+          "pd": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "ATTACKER_UPSTREAM": "pd:10000",
+          "PYTHONPATH": "/app/src"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "volumes": [
+          {
+            "bind": {},
+            "read_only": true,
+            "source": "@LAB_DIR@/src",
+            "target": "/app/src",
+            "type": "bind"
+          }
+        ],
+        "working_dir": "/app"
+      },
+      "cp": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "sleep",
+          "infinity"
+        ],
+        "depends_on": {
+          "attacker": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "CP_UPSTREAM": "attacker:10000",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      },
+      "pd": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "pd_driver.py"
+        ],
+        "entrypoint": null,
+        "environment": {
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      }
+    }
+  },
+  "docker-compose.replay.yml": {
+    "name": "interlock-assess",
+    "networks": {
+      "labnet": {
+        "internal": true,
+        "ipam": {},
+        "name": "interlock-assess_labnet"
+      }
+    },
+    "services": {
+      "attacker": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "-m",
+          "interlock.osdp.attacks.replay"
+        ],
+        "depends_on": {
+          "pd": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "ATTACKER_UPSTREAM": "pd:10000",
+          "PYTHONPATH": "/app/src"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "volumes": [
+          {
+            "bind": {},
+            "read_only": true,
+            "source": "@LAB_DIR@/src",
+            "target": "/app/src",
+            "type": "bind"
+          }
+        ],
+        "working_dir": "/app"
+      },
+      "cp": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "cp_driver.py"
+        ],
+        "depends_on": {
+          "attacker": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "CP_UPSTREAM": "attacker:10000",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      },
+      "pd": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "pd_driver.py"
+        ],
+        "entrypoint": null,
+        "environment": {
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      }
+    }
+  },
+  "docker-compose.spoof.yml": {
+    "name": "interlock-assess",
+    "networks": {
+      "labnet": {
+        "internal": true,
+        "ipam": {},
+        "name": "interlock-assess_labnet"
+      }
+    },
+    "services": {
+      "attacker": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "-m",
+          "interlock.osdp.attacks.spoof"
+        ],
+        "depends_on": {
+          "pd": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "ATTACKER_UPSTREAM": "pd:10000",
+          "PYTHONPATH": "/app/src"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "volumes": [
+          {
+            "bind": {},
+            "read_only": true,
+            "source": "@LAB_DIR@/src",
+            "target": "/app/src",
+            "type": "bind"
+          }
+        ],
+        "working_dir": "/app"
+      },
+      "cp": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "cp_driver.py"
+        ],
+        "depends_on": {
+          "attacker": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "CP_UPSTREAM": "attacker:10000",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      },
+      "pd": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "pd_driver.py"
+        ],
+        "entrypoint": null,
+        "environment": {
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      }
+    }
+  },
+  "docker-compose.tap.yml": {
+    "name": "interlock-assess",
+    "networks": {
+      "labnet": {
+        "internal": true,
+        "ipam": {},
+        "name": "interlock-assess_labnet"
+      }
+    },
+    "services": {
+      "attacker": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "-m",
+          "interlock.osdp.tap_capture"
+        ],
+        "depends_on": {
+          "pd": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "ATTACKER_UPSTREAM": "pd:10000",
+          "PYTHONPATH": "/app/src"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "volumes": [
+          {
+            "bind": {},
+            "read_only": true,
+            "source": "@LAB_DIR@/src",
+            "target": "/app/src",
+            "type": "bind"
+          }
+        ],
+        "working_dir": "/app"
+      },
+      "cp": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "cp_driver.py"
+        ],
+        "depends_on": {
+          "attacker": {
+            "condition": "service_started",
+            "required": true
+          }
+        },
+        "entrypoint": null,
+        "environment": {
+          "CP_UPSTREAM": "attacker:10000",
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      },
+      "pd": {
+        "build": {
+          "context": "@LAB_DIR@",
+          "dockerfile": "Dockerfile"
+        },
+        "command": [
+          "python",
+          "pd_driver.py"
+        ],
+        "entrypoint": null,
+        "environment": {
+          "LAB_SCENARIO": "cleartext"
+        },
+        "networks": {
+          "labnet": null
+        },
+        "working_dir": "/app/lab/osdp"
+      }
+    }
+  }
+}
