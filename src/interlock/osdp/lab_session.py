@@ -222,12 +222,27 @@ def _volumes_reason(volumes: object, lab_dir: Path) -> str | None:
     return None
 
 
+def _local_context(context: object) -> bool:
+    """Return True for a build context compose resolved to a local directory.
+
+    Compose prints a local context as an absolute path and leaves a remote one (a URL, a git
+    remote, a ``#ref`` suffix) as written, which joined onto the lab dir would read as a
+    relative path inside it. So only an absolute path with no scheme and no ref passes.
+    """
+    return (
+        isinstance(context, str)
+        and "://" not in context
+        and "#" not in context
+        and Path(context).is_absolute()
+    )
+
+
 def _plain_build(build: object, lab_dir: Path) -> bool:
-    """Return True for a build of only a context and Dockerfile, both inside the lab dir."""
+    """Return True for a build of only a local context and Dockerfile, both inside the lab dir."""
     if not isinstance(build, Mapping) or set(build) - _BUILD_KEYS:
         return False
     context = build.get("context")
-    return _inside(lab_dir, context) and _inside(
+    return _local_context(context) and _inside(lab_dir, context) and _inside(
         lab_dir, context, build.get("dockerfile", "Dockerfile")
     )
 
