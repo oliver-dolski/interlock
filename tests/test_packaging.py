@@ -8,9 +8,13 @@ so a later edit cannot quietly drop a field a reader of the package page relies 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import io
 import shutil
 import subprocess
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -115,3 +119,169 @@ def test_tracked_text_files_have_no_long_dash() -> None:
         if any(dash in line for dash in _LONG_DASHES)
     ]
     assert not offenders, "long dash in a tracked file:\n" + "\n".join(offenders)
+
+
+# The sdist allow-list, as probed against hatchling: everything a source user needs, nothing else.
+_PROBED_ONLY_INCLUDE = [
+    "src/interlock",
+    "tests",
+    "lab",
+    "docs",
+    "Dockerfile",
+    "Dockerfile.vuln",
+    "lab.sh",
+    "docker-compose.yml",
+    "docker-compose.tap.yml",
+    "docker-compose.fuzz.yml",
+    "docker-compose.downgrade.yml",
+    "docker-compose.spoof.yml",
+    "docker-compose.replay.yml",
+    "docker-compose.cve.yml",
+    "docker-compose.vuln.yml",
+    "docker-compose.lockstate.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+]
+
+_VERSION = "0.1.0"
+_SDIST_ROOT = f"interlock-{_VERSION}"
+_DIST_INFO = f"interlock-{_VERSION}.dist-info"
+_CLEAN_SDIST = [
+    "src/interlock/__init__.py",
+    "tests/test_packaging.py",
+    "lab/osdp/scenarios.py",
+    "docs/plugin-authoring.md",
+    "Dockerfile",
+    "lab.sh",
+    "docker-compose.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+    "PKG-INFO",
+    ".gitignore",
+]
+_CLEAN_WHEEL = [
+    "interlock/__init__.py",
+    f"{_DIST_INFO}/METADATA",
+    f"{_DIST_INFO}/RECORD",
+    f"{_DIST_INFO}/licenses/LICENSE",
+    f"{_DIST_INFO}/licenses/NOTICE",
+]
+
+
+def _sdist_table() -> dict[str, Any]:
+    table: dict[str, Any] = _project()["tool"]["hatch"]["build"]["targets"]["sdist"]
+    return table
+
+
+def _check_dist() -> Any:
+    path = REPO_ROOT / "scripts" / "check_dist.py"
+    spec = importlib.util.spec_from_file_location("check_dist", path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_sdist(path: Path, members: list[str]) -> None:
+    with tarfile.open(path, "w:gz") as archive:
+        for member in members:
+            info = tarfile.TarInfo(f"{_SDIST_ROOT}/{member}")
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+
+
+def _write_wheel(path: Path, members: list[str]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for member in members:
+            archive.writestr(member, b"x")
+
+
+def _dist_dir(
+    tmp_path: Path,
+    sdist: list[str] | None = None,
+    wheel: list[str] | None = None,
+) -> Path:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    _write_sdist(dist / f"{_SDIST_ROOT}.tar.gz", _CLEAN_SDIST if sdist is None else sdist)
+    whl = dist / f"interlock-{_VERSION}-py3-none-any.whl"
+    _write_wheel(whl, _CLEAN_WHEEL if wheel is None else wheel)
+    return dist
+
+
+def test_sdist_only_includes_the_probed_allow_list() -> None:
+    table = _sdist_table()
+    assert table["only-include"] == _PROBED_ONLY_INCLUDE
+    assert "docs/media" in table["exclude"]
+
+
+def test_gate_allow_list_mirrors_only_include() -> None:
+    expected = set(_sdist_table()["only-include"]) | {"PKG-INFO", ".gitignore"}
+    assert set(_check_dist().ALLOWED_SDIST_ROOTS) == expected
+
+
+def test_gate_passes_a_clean_dist_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _check_dist().main([str(_dist_dir(tmp_path))]) == 0
+    assert "check_dist: ok" in capsys.readouterr().out
+
+
+def test_gate_rejects_an_extra_sdist_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dist = _dist_dir(tmp_path, sdist=[*_CLEAN_SDIST, "notes.md"])
+    assert _check_dist().main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert "notes.md" in captured.out + captured.err
+    assert "check_dist: ok" not in captured.out
+
+
+def test_gate_rejects_docs_media(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    dist = _dist_dir(tmp_path, sdist=[*_CLEAN_SDIST, "docs/media/demo.gif"])
+    assert _check_dist().main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert "docs/media/demo.gif" in captured.out + captured.err
+
+
+def test_gate_requires_notice_at_the_sdist_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dist = _dist_dir(tmp_path, sdist=[m for m in _CLEAN_SDIST if m != "NOTICE"])
+    assert _check_dist().main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert "NOTICE" in captured.out + captured.err
+
+
+def test_gate_rejects_a_wheel_member_outside_the_package(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dist = _dist_dir(tmp_path, wheel=[*_CLEAN_WHEEL, "lab/osdp/scenarios.py"])
+    assert _check_dist().main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert "lab/osdp/scenarios.py" in captured.out + captured.err
+
+
+def test_gate_requires_licence_files_in_the_wheel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wheel = [m for m in _CLEAN_WHEEL if not m.endswith("/licenses/NOTICE")]
+    assert _check_dist().main([str(_dist_dir(tmp_path, wheel=wheel))]) == 1
+    captured = capsys.readouterr()
+    assert "licenses/NOTICE" in captured.out + captured.err
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_gate_requires_exactly_one_sdist(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], count: int
+) -> None:
+    dist = _dist_dir(tmp_path)
+    if count == 0:
+        (dist / f"{_SDIST_ROOT}.tar.gz").unlink()
+    else:
+        _write_sdist(dist / "interlock-0.2.0.tar.gz", _CLEAN_SDIST)
+    assert _check_dist().main([str(dist)]) == 1
+    captured = capsys.readouterr()
+    assert "exactly one sdist" in captured.out + captured.err
