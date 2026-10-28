@@ -225,7 +225,7 @@ def test_gate_allow_list_mirrors_only_include() -> None:
 
 
 def test_gate_passes_a_clean_dist_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert _check_dist().main([str(_dist_dir(tmp_path))]) == 0
+    assert _gate_on_this_checkout().main([str(_dist_dir(tmp_path))]) == 0
     assert "check_dist: ok" in capsys.readouterr().out
 
 
@@ -233,7 +233,7 @@ def test_gate_rejects_an_extra_sdist_root(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     dist = _dist_dir(tmp_path, sdist=[*_CLEAN_SDIST, "notes.md"])
-    assert _check_dist().main([str(dist)]) == 1
+    assert _gate_on_this_checkout().main([str(dist)]) == 1
     captured = capsys.readouterr()
     assert "notes.md" in captured.out + captured.err
     assert "check_dist: ok" not in captured.out
@@ -241,7 +241,7 @@ def test_gate_rejects_an_extra_sdist_root(
 
 def test_gate_rejects_docs_media(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     dist = _dist_dir(tmp_path, sdist=[*_CLEAN_SDIST, "docs/media/demo.gif"])
-    assert _check_dist().main([str(dist)]) == 1
+    assert _gate_on_this_checkout().main([str(dist)]) == 1
     captured = capsys.readouterr()
     assert "docs/media/demo.gif" in captured.out + captured.err
 
@@ -261,6 +261,14 @@ def _gate(monkeypatch: pytest.MonkeyPatch, tracked: frozenset[str] | None) -> An
     gate = _check_dist()
     monkeypatch.setattr(gate, "tracked_files", lambda repo: tracked)
     return gate
+
+
+def _gate_on_this_checkout() -> Any:
+    """Return the gate module as CI runs it, reading this checkout's tracked files through git."""
+    git = shutil.which("git")
+    if git is None or not (REPO_ROOT / ".git").exists():
+        pytest.skip("git or the repository is unavailable")
+    return _check_dist()
 
 
 @pytest.mark.parametrize(
@@ -336,7 +344,7 @@ def test_gate_fails_closed_when_git_cannot_list_tracked_files(
 
 
 def test_gate_reads_the_tracked_files_of_this_checkout() -> None:
-    tracked = _check_dist().tracked_files(REPO_ROOT)
+    tracked = _gate_on_this_checkout().tracked_files(REPO_ROOT)
     assert tracked is not None
     assert {"pyproject.toml", "scripts/check_dist.py", "src/interlock/__init__.py"} <= tracked
 
@@ -352,7 +360,7 @@ def test_gate_requires_notice_at_the_sdist_root(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     dist = _dist_dir(tmp_path, sdist=[m for m in _CLEAN_SDIST if m != "NOTICE"])
-    assert _check_dist().main([str(dist)]) == 1
+    assert _gate_on_this_checkout().main([str(dist)]) == 1
     captured = capsys.readouterr()
     assert "NOTICE" in captured.out + captured.err
 
@@ -361,7 +369,7 @@ def test_gate_rejects_a_wheel_member_outside_the_package(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     dist = _dist_dir(tmp_path, wheel=[*_CLEAN_WHEEL, "lab/osdp/scenarios.py"])
-    assert _check_dist().main([str(dist)]) == 1
+    assert _gate_on_this_checkout().main([str(dist)]) == 1
     captured = capsys.readouterr()
     assert "lab/osdp/scenarios.py" in captured.out + captured.err
 
@@ -370,7 +378,7 @@ def test_gate_requires_licence_files_in_the_wheel(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     wheel = [m for m in _CLEAN_WHEEL if not m.endswith("/licenses/NOTICE")]
-    assert _check_dist().main([str(_dist_dir(tmp_path, wheel=wheel))]) == 1
+    assert _gate_on_this_checkout().main([str(_dist_dir(tmp_path, wheel=wheel))]) == 1
     captured = capsys.readouterr()
     assert "licenses/NOTICE" in captured.out + captured.err
 

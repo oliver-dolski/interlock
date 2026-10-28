@@ -10,9 +10,12 @@ scan also keeps the tests from joining a host path with a '/' literal, which onl
 from __future__ import annotations
 
 import ast
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 # The POSIX terminal modules the Windows stdlib does not ship.
 _BLOCKED = ("termios", "tty", "fcntl", "pty")
@@ -62,8 +65,11 @@ _WIN32_SKIPPED = {
 
 
 def _check_attr(attrs: list[str], paths: list[str]) -> dict[tuple[str, str], str]:
+    git = shutil.which("git")
+    if git is None or not (_REPO / ".git").exists():
+        pytest.skip("git or the repository is unavailable")
     out = subprocess.run(
-        ["git", "check-attr", *attrs, "--", *paths],
+        [git, "check-attr", *attrs, "--", *paths],
         cwd=_REPO,
         capture_output=True,
         text=True,
