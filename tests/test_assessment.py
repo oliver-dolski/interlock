@@ -66,6 +66,8 @@ _PD_LOG = f"pd-1  | {_PD_LISTENING}\n{_PD_REJECTED}"
 _CP_AUTHORISED = "interlock-lab: CP authorised unlock on card read"
 _RMAC_I_REJECTED = "osdp: CP: Out of order REPLY_RMAC_I"
 _UNLOCKED = "interlock-lab: LOCK state=UNLOCKED"
+# The line a relay prints when it injects the forged CMD_OUT (spoof.announce_inject).
+_INJECTED = "attacker-1  | interlock: injected CMD_OUT seq=1\n"
 
 # The healthy-lab log per service; tests override single services. The cp log carries one
 # genuine authorisation, the CVE step's baseline.
@@ -75,11 +77,12 @@ _SPOOF_TRIGGER = "/tmp/interlock-spoof-fire"
 _REPLAY_TRIGGER = "/tmp/interlock-replay-fire"
 _CVE_TRIGGER = "/tmp/interlock-cve-fire"
 
-# What each trigger file adds to the logs once touched, on a healthy lab: both relays unlock
-# the clear-text PD, and the fixed CP rejects the replayed REPLY_RMAC_I.
+# What each trigger file adds to the logs once touched, on a healthy lab: both relays announce
+# their injection and unlock the clear-text PD, and the fixed CP rejects the replayed
+# REPLY_RMAC_I.
 _TOUCH_LOGS = {
-    _SPOOF_TRIGGER: {"pd": f"pd-1  | {_UNLOCKED}\n"},
-    _REPLAY_TRIGGER: {"pd": f"pd-1  | {_UNLOCKED}\n"},
+    _SPOOF_TRIGGER: {"attacker": _INJECTED, "pd": f"pd-1  | {_UNLOCKED}\n"},
+    _REPLAY_TRIGGER: {"attacker": _INJECTED, "pd": f"pd-1  | {_UNLOCKED}\n"},
     _CVE_TRIGGER: {"cp": f"cp-1  | {_RMAC_I_REJECTED}\n"},
 }
 
@@ -1363,10 +1366,37 @@ def test_spoof_trigger_failing_is_an_error(lab_dir: Path) -> None:
 
 
 def test_spoof_without_a_lock_transition_is_not_vulnerable(lab_dir: Path) -> None:
-    fake = FakeCompose(touch_logs={_SPOOF_TRIGGER: {}})
+    fake = FakeCompose(touch_logs={_SPOOF_TRIGGER: {"attacker": _INJECTED}})
     [result] = _run_steps(lab_dir, fake, "spoof")
     assert result.status is Status.NOT_VULNERABLE
-    assert result.detail == "armed; no lock-state transition within 120 s"
+    assert result.detail.startswith("armed; the relay injected a forged CMD_OUT")
+    assert "interlock: injected CMD_OUT seq=1" in result.detail
+    assert result.detail.endswith("no lock-state transition within 120 s")
+    assert fake.touches == [_SPOOF_TRIGGER]
+
+
+def test_spoof_without_the_injection_line_is_inconclusive(lab_dir: Path) -> None:
+    # Armed, no unlock, but the relay never said it injected: the bus was never tested.
+    fake = FakeCompose(touch_logs={_SPOOF_TRIGGER: {}})
+    [result] = _run_steps(lab_dir, fake, "spoof")
+    assert result.status is Status.INCONCLUSIVE
+    assert "never injected" in result.detail
+    assert fake.touches == [_SPOOF_TRIGGER]
+
+
+def test_spoof_unlocked_without_a_finding_is_inconclusive(
+    lab_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The verdict function saw no transition, yet the PD log shows UNLOCKED afterwards.
+    def no_finding(inject: Callable[[], None], probe: Callable[[], bool]) -> list[Finding]:
+        inject()
+        return []
+
+    monkeypatch.setattr(assessment.spoof, "run_spoof", no_finding)
+    fake = FakeCompose()
+    [result] = _run_steps(lab_dir, fake, "spoof")
+    assert result.status is Status.INCONCLUSIVE
+    assert "cannot be attributed" in result.detail
     assert fake.touches == [_SPOOF_TRIGGER]
 
 
